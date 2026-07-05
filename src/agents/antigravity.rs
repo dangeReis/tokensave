@@ -4,9 +4,8 @@
 //!
 //! - `~/.gemini/antigravity/mcp_config.json` — the Antigravity IDE config,
 //!   shape `{"mcpServers": {"tokensave": {...}}}`.
-//! - `~/.gemini/antigravity-cli/plugins/tokensave.json` — the Antigravity
-//!   CLI (`agy`) plugin file, same shape. Required because the IDE config
-//!   is not picked up by the CLI (#85).
+//! - `~/.gemini/antigravity-cli/mcp_config.json` — the Antigravity CLI (`agy`)
+//!   config, same shape. Required because the IDE config is not picked up by the CLI (#85).
 //!
 //! Both files are kept in sync by `install` and `uninstall`; `doctor` checks
 //! both and reports each location separately.
@@ -29,10 +28,10 @@ fn mcp_config_path(home: &Path) -> std::path::PathBuf {
     home.join(".gemini/antigravity/mcp_config.json")
 }
 
-/// Per-plugin file used by the Antigravity CLI. Holds the same shape as
-/// the IDE config so a future shared loader can read either location.
-fn cli_plugin_path(home: &Path) -> std::path::PathBuf {
-    home.join(".gemini/antigravity-cli/plugins/tokensave.json")
+/// Config file used by the Antigravity CLI. Holds the same shape as
+/// the IDE config.
+fn cli_config_path(home: &Path) -> std::path::PathBuf {
+    home.join(".gemini/antigravity-cli/mcp_config.json")
 }
 
 impl AgentIntegration for AntigravityIntegration {
@@ -74,26 +73,35 @@ impl AgentIntegration for AntigravityIntegration {
             mcp_path.display()
         );
 
-        // 2. Antigravity CLI plugin (~/.gemini/antigravity-cli/plugins/tokensave.json).
+        // 2. Antigravity CLI config (~/.gemini/antigravity-cli/mcp_config.json).
         //    Same shape as the IDE config; required because the IDE config is
         //    not picked up by the CLI (#85).
-        let plugin_path = cli_plugin_path(&ctx.home);
-        if let Some(parent) = plugin_path.parent() {
+        let cli_path = cli_config_path(&ctx.home);
+        if let Some(parent) = cli_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let plugin_backup = backup_config_file(&plugin_path)?;
-        let plugin_settings = json!({
-            "mcpServers": {
-                "tokensave": {
-                    "command": bin,
-                    "args": ["serve"],
+        let cli_backup = backup_config_file(&cli_path)?;
+        let mut cli_settings = match load_json_file_strict(&cli_path) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(ref b) = cli_backup {
+                    eprintln!("  Backup preserved at: {}", b.display());
                 }
+                return Err(e);
             }
+        };
+        let cli_bin = crate::agents::preserve_mcp_command(
+            cli_settings.pointer("/mcpServers/tokensave/command"),
+            &ctx.tokensave_bin,
+        );
+        cli_settings["mcpServers"]["tokensave"] = json!({
+            "command": cli_bin,
+            "args": ["serve"]
         });
-        safe_write_json_file(&plugin_path, &plugin_settings, plugin_backup.as_deref())?;
+        safe_write_json_file(&cli_path, &cli_settings, cli_backup.as_deref())?;
         eprintln!(
-            "\x1b[32m✔\x1b[0m Added tokensave CLI plugin to {}",
-            plugin_path.display()
+            "\x1b[32m✔\x1b[0m Added tokensave MCP server to {}",
+            cli_path.display()
         );
 
         eprintln!();
@@ -108,7 +116,8 @@ impl AgentIntegration for AntigravityIntegration {
     fn uninstall(&self, ctx: &InstallContext) -> Result<()> {
         let mcp_path = mcp_config_path(&ctx.home);
         uninstall_mcp_server(&mcp_path);
-        uninstall_cli_plugin(&cli_plugin_path(&ctx.home));
+        let cli_path = cli_config_path(&ctx.home);
+        uninstall_mcp_server(&cli_path);
 
         eprintln!();
         eprintln!("Uninstall complete. Tokensave has been removed from Antigravity.");
@@ -119,7 +128,7 @@ impl AgentIntegration for AntigravityIntegration {
     fn healthcheck(&self, dc: &mut DoctorCounters, ctx: &HealthcheckContext) {
         eprintln!("\n\x1b[1mAntigravity integration\x1b[0m");
         doctor_check_settings(dc, &ctx.home);
-        doctor_check_cli_plugin(dc, &ctx.home);
+        doctor_check_cli_settings(dc, &ctx.home);
     }
 
     fn is_detected(&self, home: &Path) -> bool {
@@ -140,9 +149,9 @@ impl AgentIntegration for AntigravityIntegration {
                     .is_some()
         };
         let cli_ok = {
-            let plugin_path = cli_plugin_path(home);
-            plugin_path.exists()
-                && load_json_file(&plugin_path)
+            let cli_path = cli_config_path(home);
+            cli_path.exists()
+                && load_json_file(&cli_path)
                     .get("mcpServers")
                     .and_then(|v| v.get("tokensave"))
                     .is_some()
@@ -208,19 +217,6 @@ fn uninstall_mcp_server(mcp_path: &Path) {
     }
 }
 
-/// Remove the per-plugin file the CLI loader picks up. Unlike the IDE config
-/// — which is shared across other tools — the plugin file belongs exclusively
-/// to tokensave, so we just delete it.
-fn uninstall_cli_plugin(plugin_path: &Path) {
-    if !plugin_path.exists() {
-        eprintln!("  {} not found, skipping", plugin_path.display());
-        return;
-    }
-    if std::fs::remove_file(plugin_path).is_ok() {
-        eprintln!("\x1b[32m✔\x1b[0m Removed {} ", plugin_path.display());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Healthcheck helpers
 // ---------------------------------------------------------------------------
@@ -252,29 +248,29 @@ fn doctor_check_settings(dc: &mut DoctorCounters, home: &Path) {
     }
 }
 
-fn doctor_check_cli_plugin(dc: &mut DoctorCounters, home: &Path) {
-    let plugin_path = cli_plugin_path(home);
+fn doctor_check_cli_settings(dc: &mut DoctorCounters, home: &Path) {
+    let cli_path = cli_config_path(home);
 
-    if !plugin_path.exists() {
+    if !cli_path.exists() {
         dc.warn(&format!(
-            "{} not found — run `tokensave install --agent antigravity` if you use the Antigravity CLI (#85)",
-            plugin_path.display()
+            "{} not found — run `tokensave install --agent antigravity` if you use the Antigravity CLI",
+            cli_path.display()
         ));
         return;
     }
 
-    let settings = load_json_file(&plugin_path);
+    let settings = load_json_file(&cli_path);
     let server = settings.get("mcpServers").and_then(|v| v.get("tokensave"));
 
     if server.and_then(|v| v.as_object()).is_some() {
         dc.pass(&format!(
-            "CLI plugin registered in {}",
-            plugin_path.display()
+            "CLI MCP server registered in {}",
+            cli_path.display()
         ));
     } else {
         dc.fail(&format!(
-            "CLI plugin file exists but lacks `mcpServers.tokensave` in {} — run `tokensave install --agent antigravity`",
-            plugin_path.display()
+            "CLI MCP server NOT registered in {} — run `tokensave install --agent antigravity`",
+            cli_path.display()
         ));
     }
 }
