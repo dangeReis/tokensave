@@ -29,6 +29,25 @@ struct ExtractionState {
     timestamp: u64,
     /// Whether the current declaration is inside an `export_statement`.
     in_export: bool,
+    /// Maps dictionary object names to their (property key, value name) pairs
+    /// (dynamic dispatch). Colliding names merge — a conservative union beats
+    /// last-write-wins for dead-code liveness.
+    dictionaries: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Subscript call sites (`handlers[key]()`) held until the whole file is
+    /// traversed, so tables declared after their call sites still resolve.
+    pending_dispatch: Vec<PendingDispatch>,
+}
+
+/// A `dict[key]()` call site awaiting end-of-file dispatch-table resolution.
+struct PendingDispatch {
+    from_node_id: String,
+    dict_name: String,
+    /// `Some` when the subscript index is a string literal (`dict['add']()`).
+    key: Option<String>,
+    /// Textual callee to fall back on when no table by that name exists.
+    fallback: String,
+    line: u32,
+    column: u32,
 }
 
 impl ExtractionState {
@@ -47,6 +66,8 @@ impl ExtractionState {
             source: source.as_bytes().to_vec(),
             timestamp,
             in_export: false,
+            dictionaries: std::collections::HashMap::new(),
+            pending_dispatch: Vec::new(),
         }
     }
 
@@ -473,15 +494,7 @@ impl TypeScriptExtractor {
                 "call_expression" => {
                     if !Self::maybe_visit_test_call(state, body) {
                         if let Some(callee) = body.named_child(0) {
-                            let callee_name = state.node_text(callee);
-                            state.unresolved_refs.push(UnresolvedRef {
-                                from_node_id: id.clone(),
-                                reference_name: callee_name,
-                                reference_kind: EdgeKind::Calls,
-                                line: body.start_position().row as u32,
-                                column: body.start_position().column as u32,
-                                file_path: state.file_path.clone(),
-                            });
+                            Self::push_call_refs(state, callee, body, &id);
                         }
                         Self::extract_call_sites(state, body, &id);
                     }
@@ -513,6 +526,7 @@ impl TypeScriptExtractor {
         let end_column = declarator.end_position().column as u32;
         let qualified_name = format!("{}::{}", state.qualified_prefix(), name);
         let id = generate_node_id(&state.file_path, &NodeKind::Const, &name, start_line);
+        let dict_name = name.clone();
 
         let graph_node = Node {
             id: id.clone(),
@@ -545,6 +559,8 @@ impl TypeScriptExtractor {
             parent_id: None,
         };
         state.nodes.push(graph_node);
+
+        Self::collect_dispatch_table(state, dict_name, declarator);
 
         // Contains edge from parent.
         if let Some(parent_id) = state.parent_node_id() {
@@ -1641,6 +1657,158 @@ impl TypeScriptExtractor {
         Self::emit_typed_method_calls(state, body, fn_node_id, &var_types);
     }
 
+    /// Records `const name = { ... }` object literals as dispatch tables.
+    /// Peels `as const` / `satisfies` / parens wrappers; records identifier
+    /// and member-expression values (an inline arrow/function value has no
+    /// name a call edge could resolve to). Colliding table names merge.
+    fn collect_dispatch_table(
+        state: &mut ExtractionState,
+        dict_name: String,
+        declarator: TsNode<'_>,
+    ) {
+        let Some(mut value) = declarator.child_by_field_name("value") else {
+            return;
+        };
+        while matches!(
+            value.kind(),
+            "as_expression"
+                | "satisfies_expression"
+                | "parenthesized_expression"
+                | "non_null_expression"
+        ) {
+            match value.named_child(0) {
+                Some(inner) => value = inner,
+                None => return,
+            }
+        }
+        if value.kind() != "object" {
+            return;
+        }
+        let mut entries = Vec::new();
+        let mut cursor = value.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                match child.kind() {
+                    "pair" => {
+                        let key = child.child_by_field_name("key").map(|k| {
+                            state
+                                .node_text(k)
+                                .trim_matches(['"', '\'', '`'])
+                                .to_string()
+                        });
+                        if let (Some(key), Some(pair_val)) =
+                            (key, child.child_by_field_name("value"))
+                        {
+                            if matches!(pair_val.kind(), "identifier" | "member_expression") {
+                                entries.push((key, state.node_text(pair_val)));
+                            }
+                        }
+                    }
+                    "shorthand_property_identifier" => {
+                        let name = state.node_text(child);
+                        entries.push((name.clone(), name));
+                    }
+                    _ => {}
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        if !entries.is_empty() {
+            state
+                .dictionaries
+                .entry(dict_name)
+                .or_default()
+                .extend(entries);
+        }
+    }
+
+    /// Push call edge(s) for a callee. `handlers[key](...)` subscripts on a
+    /// plain identifier are deferred to end-of-file resolution (the table may
+    /// be declared after the call site); anything else pushes a textual ref.
+    fn push_call_refs(
+        state: &mut ExtractionState,
+        callee: TsNode<'_>,
+        call_node: TsNode<'_>,
+        from_node_id: &str,
+    ) {
+        if callee.kind() == "subscript_expression" {
+            if let Some(obj) = callee.child_by_field_name("object") {
+                if obj.kind() == "identifier" {
+                    let key = callee
+                        .child_by_field_name("index")
+                        .filter(|i| i.kind() == "string")
+                        .map(|i| {
+                            state
+                                .node_text(i)
+                                .trim_matches(['"', '\'', '`'])
+                                .to_string()
+                        });
+                    let pending = PendingDispatch {
+                        from_node_id: from_node_id.to_string(),
+                        dict_name: state.node_text(obj),
+                        key,
+                        fallback: state.node_text(callee),
+                        line: call_node.start_position().row as u32,
+                        column: call_node.start_position().column as u32,
+                    };
+                    state.pending_dispatch.push(pending);
+                    return;
+                }
+            }
+        }
+        let callee_name = state.node_text(callee);
+        state.unresolved_refs.push(UnresolvedRef {
+            from_node_id: from_node_id.to_string(),
+            reference_name: callee_name,
+            reference_kind: EdgeKind::Calls,
+            line: call_node.start_position().row as u32,
+            column: call_node.start_position().column as u32,
+            file_path: state.file_path.clone(),
+        });
+    }
+
+    /// Resolves deferred `dict[key]()` call sites against the completed
+    /// dispatch-table map. A string-literal key with matching entries emits
+    /// only those targets; a dynamic key fans out to the whole table
+    /// (conservative over-approximation for liveness); an unknown table falls
+    /// back to the textual callee.
+    fn expand_pending_dispatch(state: &mut ExtractionState) {
+        let pending = std::mem::take(&mut state.pending_dispatch);
+        for p in pending {
+            let targets: Vec<String> = match state.dictionaries.get(&p.dict_name) {
+                Some(entries) => {
+                    let keyed: Vec<String> = match &p.key {
+                        Some(k) => entries
+                            .iter()
+                            .filter(|(key, _)| key == k)
+                            .map(|(_, t)| t.clone())
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    if keyed.is_empty() {
+                        entries.iter().map(|(_, t)| t.clone()).collect()
+                    } else {
+                        keyed
+                    }
+                }
+                None => vec![p.fallback],
+            };
+            for target in targets {
+                state.unresolved_refs.push(UnresolvedRef {
+                    from_node_id: p.from_node_id.clone(),
+                    reference_name: target,
+                    reference_kind: EdgeKind::Calls,
+                    line: p.line,
+                    column: p.column,
+                    file_path: state.file_path.clone(),
+                });
+            }
+        }
+    }
+
     fn extract_call_sites(state: &mut ExtractionState, node: TsNode<'_>, fn_node_id: &str) {
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
@@ -1654,15 +1822,7 @@ impl TypeScriptExtractor {
                             // Get the callee name.
                             let callee = child.named_child(0);
                             if let Some(callee) = callee {
-                                let callee_name = state.node_text(callee);
-                                state.unresolved_refs.push(UnresolvedRef {
-                                    from_node_id: fn_node_id.to_string(),
-                                    reference_name: callee_name,
-                                    reference_kind: EdgeKind::Calls,
-                                    line: child.start_position().row as u32,
-                                    column: child.start_position().column as u32,
-                                    file_path: state.file_path.clone(),
-                                });
+                                Self::push_call_refs(state, callee, child, fn_node_id);
                             }
                             // Recurse: arguments may hold nested calls, arrow
                             // callbacks (#209), or JSX.
@@ -1672,6 +1832,19 @@ impl TypeScriptExtractor {
                     // A JSX render is a dependency on the component (#210).
                     "jsx_opening_element" | "jsx_self_closing_element" => {
                         Self::extract_jsx_component_ref(state, child, fn_node_id);
+                        Self::extract_call_sites(state, child, fn_node_id);
+                    }
+                    // Function-local dispatch tables (`const handlers = {...}`
+                    // inside a body) have no graph node of their own but still
+                    // resolve subscript calls. Recurse too: the initializer
+                    // may hold nested calls.
+                    "variable_declarator" => {
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            if name_node.kind() == "identifier" {
+                                let name = state.node_text(name_node);
+                                Self::collect_dispatch_table(state, name, child);
+                            }
+                        }
                         Self::extract_call_sites(state, child, fn_node_id);
                     }
                     _ => {
@@ -2004,7 +2177,8 @@ impl TypeScriptExtractor {
     }
 
     /// Build the final `ExtractionResult` from the accumulated state.
-    fn build_result(state: ExtractionState, start: Instant) -> ExtractionResult {
+    fn build_result(mut state: ExtractionState, start: Instant) -> ExtractionResult {
+        Self::expand_pending_dispatch(&mut state);
         ExtractionResult {
             nodes: state.nodes,
             edges: state.edges,

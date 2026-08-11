@@ -437,6 +437,126 @@ function main(): void {
 }
 
 #[test]
+fn test_ts_dictionary_dispatch_tracking() {
+    let source = r#"
+function handleAdd(): void {}
+function handleRemove(): void {}
+function handleClear(): void {}
+
+const handlers = { add: handleAdd, remove: handleRemove, handleClear };
+
+function dispatch(action: string): void {
+    handlers[action]();
+}
+"#;
+    let extractor = TypeScriptExtractor;
+    let result = extractor.extract("dispatch.ts", source);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+    let call_refs: Vec<_> = result
+        .unresolved_refs
+        .iter()
+        .filter(|r| r.reference_kind == EdgeKind::Calls)
+        .collect();
+    // `handlers[action]()` should fan out to every table value, including the
+    // shorthand property, instead of a textual `handlers[action]` ref.
+    for handler in ["handleAdd", "handleRemove", "handleClear"] {
+        assert!(
+            call_refs.iter().any(|r| r.reference_name == handler),
+            "dispatch should have a call ref to {handler}, got: {:?}",
+            call_refs
+                .iter()
+                .map(|r| &r.reference_name)
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        !call_refs
+            .iter()
+            .any(|r| r.reference_name.contains("handlers[")),
+        "subscript callee should be resolved, not kept as text"
+    );
+}
+
+#[test]
+fn test_ts_dispatch_table_declared_after_call_site() {
+    let source = r#"
+export function dispatch(action: string): void {
+    handlers[action]();
+}
+
+function handleAdd(): void {}
+const handlers = { add: handleAdd } as const;
+"#;
+    let extractor = TypeScriptExtractor;
+    let result = extractor.extract("late.ts", source);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    // Resolution is deferred to end-of-file, so source order must not matter;
+    // the `as const` wrapper must be peeled.
+    assert!(
+        result
+            .unresolved_refs
+            .iter()
+            .any(|r| r.reference_kind == EdgeKind::Calls && r.reference_name == "handleAdd"),
+        "table declared after the call site should still resolve"
+    );
+}
+
+#[test]
+fn test_ts_dispatch_static_string_key_is_precise() {
+    let source = r#"
+function handleAdd(): void {}
+function handleRemove(): void {}
+const handlers = { add: handleAdd, remove: handleRemove };
+
+export function run(): void {
+    handlers['add']();
+}
+"#;
+    let extractor = TypeScriptExtractor;
+    let result = extractor.extract("static.ts", source);
+    let call_refs: Vec<_> = result
+        .unresolved_refs
+        .iter()
+        .filter(|r| r.reference_kind == EdgeKind::Calls)
+        .collect();
+    assert!(
+        call_refs.iter().any(|r| r.reference_name == "handleAdd"),
+        "static key should resolve to its target"
+    );
+    assert!(
+        !call_refs.iter().any(|r| r.reference_name == "handleRemove"),
+        "static key must not fan out to unrelated table values"
+    );
+}
+
+#[test]
+fn test_ts_dispatch_member_values_and_local_table() {
+    let source = r#"
+export function dispatch(jobType: string, payload: unknown): void {
+    const JOB_HANDLERS = { review: workers.runReview };
+    JOB_HANDLERS[jobType](payload);
+}
+"#;
+    let extractor = TypeScriptExtractor;
+    let result = extractor.extract("jobs.ts", source);
+    // Function-local table with a member-expression value — the motivating
+    // example from the dispatch-tracking issue.
+    assert!(
+        result
+            .unresolved_refs
+            .iter()
+            .any(|r| r.reference_kind == EdgeKind::Calls && r.reference_name == "workers.runReview"),
+        "local table with member-expression value should resolve, got: {:?}",
+        result
+            .unresolved_refs
+            .iter()
+            .map(|r| &r.reference_name)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn test_ts_type_alias() {
     let source = r#"
 export type StringOrNum = string | number;
