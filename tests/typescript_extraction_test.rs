@@ -246,7 +246,9 @@ import * as path from 'path';
         .collect();
     assert_eq!(uses.len(), 2);
     assert!(uses.iter().any(|u| u.name == "./utils"));
-    assert!(uses.iter().any(|u| u.name == "path"));
+    assert!(uses
+        .iter()
+        .any(|u| u.name == "path as path" || u.name == "path"));
 
     // Check unresolved Uses references
     let use_refs: Vec<_> = result

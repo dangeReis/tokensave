@@ -171,7 +171,9 @@ impl TypeScriptExtractor {
         match node.kind() {
             "export_statement" => Self::visit_export_statement(state, node),
             "function_declaration" => Self::visit_function(state, node),
-            "lexical_declaration" => Self::visit_lexical_declaration(state, node),
+            "lexical_declaration" | "variable_declaration" => {
+                Self::visit_lexical_declaration(state, node)
+            }
             "class_declaration" => Self::visit_class(state, node),
             "interface_declaration" => Self::visit_interface(state, node),
             "enum_declaration" => Self::visit_enum(state, node),
@@ -358,8 +360,8 @@ impl TypeScriptExtractor {
         }
     }
 
-    /// Extract a lexical declaration (const/let/var) looking for arrow functions
-    /// and constant declarations.
+    /// Extract a lexical/variable declaration (const/let/var) looking for require statements,
+    /// arrow functions, and constant declarations.
     fn visit_lexical_declaration(state: &mut ExtractionState, node: TsNode<'_>) {
         let is_const = Self::has_child_kind(node, "const");
 
@@ -368,8 +370,9 @@ impl TypeScriptExtractor {
             loop {
                 let child = cursor.node();
                 if child.kind() == "variable_declarator" {
-                    // Check if this is an arrow function assignment.
-                    if let Some(arrow) = find_child_by_kind(child, "arrow_function") {
+                    if let Some((alias, spec)) = Self::extract_require_declaration(state, child) {
+                        Self::visit_require_import(state, child, &alias, &spec);
+                    } else if let Some(arrow) = find_child_by_kind(child, "arrow_function") {
                         Self::visit_arrow_function(state, child, arrow);
                     } else if is_const {
                         // It's a const variable (not an arrow function).
@@ -1173,18 +1176,25 @@ impl TypeScriptExtractor {
         let text = state.node_text(node);
         // Extract the module path from the string literal.
         let module_path = Self::extract_import_path(state, node);
-        let name = module_path.clone().unwrap_or_else(|| text.clone());
+        let alias = Self::extract_import_alias(state, node);
+
+        let spec = module_path.unwrap_or_else(|| text.clone());
+        let display_name = match alias {
+            Some(ref a) if !a.is_empty() => format!("{spec} as {a}"),
+            _ => spec,
+        };
+
         let start_line = node.start_position().row as u32;
         let end_line = node.end_position().row as u32;
         let start_column = node.start_position().column as u32;
         let end_column = node.end_position().column as u32;
-        let qualified_name = format!("{}::{}", state.qualified_prefix(), name);
-        let id = generate_node_id(&state.file_path, &NodeKind::Use, &name, start_line);
+        let qualified_name = format!("{}::{}", state.qualified_prefix(), display_name);
+        let id = generate_node_id(&state.file_path, &NodeKind::Use, &display_name, start_line);
 
         let graph_node = Node {
             id: id.clone(),
             kind: NodeKind::Use,
-            name: name.clone(),
+            name: display_name.clone(),
             qualified_name,
             file_path: state.file_path.clone(),
             start_line,
@@ -1226,7 +1236,143 @@ impl TypeScriptExtractor {
         // Unresolved Uses reference.
         state.unresolved_refs.push(UnresolvedRef {
             from_node_id: id,
-            reference_name: name,
+            reference_name: display_name,
+            reference_kind: EdgeKind::Uses,
+            line: start_line,
+            column: start_column,
+            file_path: state.file_path.clone(),
+        });
+    }
+
+    /// Extracts the alias identifier from an `import_statement` node:
+    /// `import X from '<spec>'` -> `Some("X")`
+    /// `import * as X from '<spec>'` -> `Some("X")`
+    fn extract_import_alias(state: &ExtractionState, node: TsNode<'_>) -> Option<String> {
+        let clause = find_child_by_kind(node, "import_clause")?;
+        // 1. Check namespace_import (* as X)
+        if let Some(ns) = find_child_by_kind(clause, "namespace_import") {
+            if let Some(id) = find_child_by_kind(ns, "identifier") {
+                return Some(state.node_text(id));
+            }
+        }
+        // 2. Check default import (import X from ...)
+        let mut cursor = clause.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if child.kind() == "identifier" {
+                    return Some(state.node_text(child));
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    /// Extracts (alias, specifier) from a require variable declaration:
+    /// `const X = require('<spec>')`, `let X = require('<spec>')`, `var X = require('<spec>')`.
+    fn extract_require_declaration(
+        state: &ExtractionState,
+        declarator: TsNode<'_>,
+    ) -> Option<(String, String)> {
+        let name_node = declarator
+            .child_by_field_name("name")
+            .or_else(|| find_child_by_kind(declarator, "identifier"))?;
+        if name_node.kind() != "identifier" {
+            return None;
+        }
+        let alias = state.node_text(name_node);
+
+        let init = declarator
+            .child_by_field_name("value")
+            .or_else(|| find_child_by_kind(declarator, "call_expression"))?;
+        if init.kind() != "call_expression" {
+            return None;
+        }
+
+        let fn_node = init
+            .child_by_field_name("function")
+            .or_else(|| find_child_by_kind(init, "identifier"))?;
+        if state.node_text(fn_node) != "require" {
+            return None;
+        }
+
+        let args = init
+            .child_by_field_name("arguments")
+            .or_else(|| find_child_by_kind(init, "arguments"))?;
+        let str_node = find_child_by_kind(args, "string")?;
+        let text = state.node_text(str_node);
+        let spec = text.trim().trim_matches('\'').trim_matches('"').to_string();
+
+        if spec.is_empty() || alias.is_empty() {
+            None
+        } else {
+            Some((alias, spec))
+        }
+    }
+
+    /// Record a require(...) import statement as a `NodeKind::Use` node.
+    fn visit_require_import(
+        state: &mut ExtractionState,
+        node: TsNode<'_>,
+        alias: &str,
+        spec: &str,
+    ) {
+        let display_name = format!("{spec} as {alias}");
+        let text = state.node_text(node);
+        let start_line = node.start_position().row as u32;
+        let end_line = node.end_position().row as u32;
+        let start_column = node.start_position().column as u32;
+        let end_column = node.end_position().column as u32;
+        let qualified_name = format!("{}::{}", state.qualified_prefix(), display_name);
+        let id = generate_node_id(&state.file_path, &NodeKind::Use, &display_name, start_line);
+
+        let graph_node = Node {
+            id: id.clone(),
+            kind: NodeKind::Use,
+            name: display_name.clone(),
+            qualified_name,
+            file_path: state.file_path.clone(),
+            start_line,
+            attrs_start_line: start_line,
+            end_line,
+            start_column,
+            end_column,
+            signature: Some(text.trim().to_string()),
+            docstring: None,
+            visibility: Visibility::Private,
+            is_async: false,
+            branches: 0,
+            loops: 0,
+            returns: 0,
+            max_nesting: 0,
+            unsafe_blocks: 0,
+            unchecked_calls: 0,
+            assertions: 0,
+            cognitive_complexity: 0,
+            distinct_operators: 0,
+            distinct_operands: 0,
+            total_operators: 0,
+            total_operands: 0,
+            updated_at: state.timestamp,
+            parent_id: None,
+        };
+        state.nodes.push(graph_node);
+
+        if let Some(parent_id) = state.parent_node_id() {
+            state.edges.push(Edge {
+                source: parent_id.to_string(),
+                target: id.clone(),
+                kind: EdgeKind::Contains,
+                line: Some(start_line),
+            });
+        }
+
+        state.unresolved_refs.push(UnresolvedRef {
+            from_node_id: id,
+            reference_name: display_name,
             reference_kind: EdgeKind::Uses,
             line: start_line,
             column: start_column,

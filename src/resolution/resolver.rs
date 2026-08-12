@@ -254,6 +254,22 @@ fn path_proximity(a: &str, b: &str) -> i64 {
     (shared as i64 * 5).min(40)
 }
 
+/// Normalizes a path string by collapsing `.` and `..` segments.
+fn normalize_path(path: &str) -> String {
+    let mut stack = Vec::new();
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            stack.pop();
+        } else {
+            stack.push(seg);
+        }
+    }
+    stack.join("/")
+}
+
 /// True if Go source file `file_path` belongs to the package that import path
 /// `import_path` points at.
 ///
@@ -320,6 +336,10 @@ pub struct ReferenceResolver<'a> {
     /// the qualifier refers to, so same-named packages don't collide (#149
     /// Bug 1).
     go_import_qualifiers: HashMap<String, HashMap<String, String>>,
+    /// Maps `file_path` to that JS/TS file's in-scope import aliases
+    /// (`alias` -> module specifier). Built from JS/TS Use nodes formatted
+    /// as `<spec> as <alias>`.
+    js_import_qualifiers: HashMap<String, HashMap<String, String>>,
 }
 
 impl<'a> ReferenceResolver<'a> {
@@ -398,31 +418,44 @@ impl<'a> ReferenceResolver<'a> {
             }
         }
 
-        // Build the Go selector-qualifier map: for each Go Use node, record the
-        // in-scope qualifier (alias, or the package identifier derived from the
-        // import path — handling `/vN` versioned paths) -> the full import path.
+        // Build the Go selector-qualifier map and JS/TS import-alias map:
+        // for each Use node, record the in-scope qualifier/alias -> import specifier/path.
         let mut go_import_qualifiers: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut js_import_qualifiers: HashMap<String, HashMap<String, String>> = HashMap::new();
         for node in all_nodes {
-            if node.kind != NodeKind::Use || lang_from_path(&node.file_path) != "go" {
+            if node.kind != NodeKind::Use {
                 continue;
             }
-            // A Go Use node `name` is `<path>` or `<path> as <alias>`.
-            let path = node
-                .name
-                .split_once(" as ")
-                .map_or(node.name.as_str(), |(p, _)| p)
-                .trim();
-            let Some(qualifier) = crate::go_import::import_identifier(&node.name) else {
-                continue;
-            };
-            // Blank (`_`) / dot (`.`) imports derive no usable qualifier — skip.
-            if qualifier == "_" || qualifier == "." {
-                continue;
+            let lang = lang_from_path(&node.file_path);
+            if lang == "go" {
+                let path = node
+                    .name
+                    .split_once(" as ")
+                    .map_or(node.name.as_str(), |(p, _)| p)
+                    .trim();
+                let Some(qualifier) = crate::go_import::import_identifier(&node.name) else {
+                    continue;
+                };
+                // Blank (`_`) / dot (`.`) imports derive no usable qualifier — skip.
+                if qualifier == "_" || qualifier == "." {
+                    continue;
+                }
+                go_import_qualifiers
+                    .entry(node.file_path.clone())
+                    .or_default()
+                    .insert(qualifier, path.to_string());
+            } else if lang == "javascript" || lang == "typescript" {
+                if let Some((spec, alias)) = node.name.rsplit_once(" as ") {
+                    let spec = spec.trim();
+                    let alias = alias.trim();
+                    if !spec.is_empty() && !alias.is_empty() {
+                        js_import_qualifiers
+                            .entry(node.file_path.clone())
+                            .or_default()
+                            .insert(alias.to_string(), spec.to_string());
+                    }
+                }
             }
-            go_import_qualifiers
-                .entry(node.file_path.clone())
-                .or_default()
-                .insert(qualifier, path.to_string());
         }
 
         Self {
@@ -435,6 +468,7 @@ impl<'a> ReferenceResolver<'a> {
             known_names,
             import_index,
             go_import_qualifiers,
+            js_import_qualifiers,
         }
     }
 
@@ -515,14 +549,14 @@ impl<'a> ReferenceResolver<'a> {
         if uref.reference_name.contains('.') {
             // Go selector disambiguation (#149 Bug 1): if the leading qualifier
             // is a known import qualifier in this file, resolve `qualifier.Name`
-            // against the package directory that import points at. This keeps
-            // same-named packages (`internal/foo/jobs`, `internal/bar/jobs`,
-            // both `package jobs`) from collapsing onto a single name-keyed
-            // target. A qualifier that is NOT a known import is a receiver
-            // variable for a method call; that falls through to the bare-name
-            // behavior below, unchanged.
+            // against the package directory that import points at.
             if let Some(resolved) = self.try_go_selector_match(uref) {
                 return Some(resolved);
+            }
+            // JS/TS relative require/import receiver resolution (#5):
+            // Invariant: relative specifiers resolve from the requiring file's directory, never globally.
+            if let Some(outcome) = self.try_js_selector_match(uref) {
+                return outcome;
             }
             let simple_name = uref
                 .reference_name
@@ -804,12 +838,104 @@ impl<'a> ReferenceResolver<'a> {
         self.ruby_constant_owners_at(constant_path)
     }
 
+    /// JS/TS relative import receiver resolution (#5):
+    /// Invariant: relative specifiers resolve from the requiring file's directory, never globally.
+    ///
+    /// When `recv.method` is called in a JS/TS file:
+    /// 1. Check if `recv` is a known import alias recorded for `uref.file_path`.
+    /// 2. If its specifier starts with `./` or `../`:
+    ///    - Compute target file = normalize(dirname(calling file) + specifier), trying extension candidates:
+    ///      as-is, `.js`, `.ts`, `.jsx`, `.tsx`, `.mjs`, `.cjs`, and `<path>/index.js|.ts`.
+    ///    - Resolve `method` ONLY among nodes whose file equals that target file.
+    ///    - If the alias is known but no symbol matches in the target file, return `Some(None)`
+    ///      so Strategy 1b returns `None` (NO fallback to global suffix match).
+    /// 3. Receivers that are not known aliases, and bare (non-relative) specifiers, return `None`
+    ///    to keep the existing behavior unchanged.
+    fn try_js_selector_match(&self, uref: &UnresolvedRef) -> Option<Option<ResolvedRef>> {
+        let lang = lang_from_path(&uref.file_path);
+        if lang != "javascript" && lang != "typescript" {
+            return None;
+        }
+
+        let (recv, method) = uref.reference_name.split_once('.')?;
+        if method.contains('.') {
+            return None;
+        }
+
+        let specifier = self.js_import_qualifiers.get(&uref.file_path)?.get(recv)?;
+
+        if !specifier.starts_with("./") && !specifier.starts_with("../") {
+            return None;
+        }
+
+        // The receiver is a known relative import alias for this file.
+        // Invariant: relative specifiers resolve from the requiring file's directory, never globally.
+
+        let caller_dir = std::path::Path::new(&uref.file_path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+
+        let raw_combined = if caller_dir.is_empty() {
+            specifier.to_string()
+        } else {
+            format!("{caller_dir}/{specifier}")
+        };
+
+        let base_target = normalize_path(&raw_combined);
+
+        let candidate_files = [
+            base_target.clone(),
+            format!("{base_target}.js"),
+            format!("{base_target}.ts"),
+            format!("{base_target}.jsx"),
+            format!("{base_target}.tsx"),
+            format!("{base_target}.mjs"),
+            format!("{base_target}.cjs"),
+            format!("{base_target}/index.js"),
+            format!("{base_target}/index.ts"),
+        ];
+
+        let candidates = self.name_cache.get(method)?;
+
+        for target_file in &candidate_files {
+            let matched: Vec<&Node> = candidates
+                .iter()
+                .copied()
+                .filter(|n| kind_compatible(uref, &n.kind))
+                .filter(|n| n.file_path == *target_file)
+                .collect();
+
+            if matched.len() == 1 {
+                return Some(Some(ResolvedRef {
+                    original: uref.clone(),
+                    target_node_id: matched[0].id.clone(),
+                    confidence: 0.95,
+                    resolved_by: "js-relative-import".to_string(),
+                }));
+            }
+            if matched.len() > 1 {
+                if let Some(best) = Self::find_best_match(uref, &matched, &self.import_index) {
+                    return Some(Some(ResolvedRef {
+                        original: uref.clone(),
+                        target_node_id: best.id.clone(),
+                        confidence: 0.9,
+                        resolved_by: "js-relative-import".to_string(),
+                    }));
+                }
+            }
+        }
+
+        // Alias is known and relative, but no symbol matches in the target file.
+        // Invariant: relative specifiers resolve from the requiring file's directory, never globally.
+        Some(None)
+    }
+
     /// Strategy 2: exact name match using the name cache.
     fn try_exact_name_match(&self, uref: &UnresolvedRef) -> Option<ResolvedRef> {
         // Skip cross-file resolution for blocklisted names (too ambiguous).
         if CROSS_FILE_BLOCKLIST.contains(&uref.reference_name.as_str()) {
             // Still allow same-file resolution, but apply the same
-            // kind-compatibility filter as the non-blocklist path —
             // otherwise a `Calls` ref to `new()` happily binds to a
             // same-file `struct new` because that's the only same-file
             // node with the name.
