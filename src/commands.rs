@@ -44,9 +44,30 @@ pub(crate) async fn handle_branch_action(action: BranchAction) -> tokensave::err
                 eprintln!("  {name}{marker} — {size}{parent}, synced {synced}");
             }
         }
-        BranchAction::Add { name, path } => {
+        BranchAction::Add {
+            name,
+            path,
+            if_enabled,
+        } => {
             let project_path = tokensave::config::resolve_path(path);
             let tokensave_dir = get_tokensave_dir(&project_path);
+
+            // #397: an automated caller (the `post-checkout` hook) passes
+            // `--if-enabled` so the `auto_track` knob governs this path too.
+            // Before this, `auto_track` was read only inside `TokenSave::open`
+            // and the hook tracked unconditionally, so the knob was not
+            // authoritative — on fresh installs as much as old ones. Checked
+            // before anything is read or written, so a declined auto-track
+            // costs nothing. Silent by design: a hook runs on every checkout
+            // and must not narrate.
+            if if_enabled {
+                let config = tokensave::config::load_config(&project_path).unwrap_or_default();
+                let enabled =
+                    tokensave::config::env_bool_override("TOKENSAVE_AUTO_TRACK", config.auto_track);
+                if !enabled {
+                    return Ok(());
+                }
+            }
 
             let branch_name = match name {
                 Some(n) => n,
@@ -584,6 +605,9 @@ pub(crate) async fn init_and_index(
         // compact headline (and its "rerun with --verbose" hint) would repeat it.
         print_skipped_extension_summary(&result.skipped_extensions);
     }
+    if let Some(warning) = cg.warn_skipped_hidden_dirs() {
+        eprintln!("{warning}");
+    }
     global::update_global_db(&cg).await;
     Ok(cg)
 }
@@ -811,8 +835,15 @@ pub(crate) fn print_skipped_extension_summary(skipped: &[(String, usize)]) {
         eprintln!();
         eprintln!("\x1b[33m{headline}\x1b[0m");
         eprintln!(
-            "\x1b[2m  No extractor is registered for these extensions. \
-             Rerun with --doctor (or --verbose) for the full list.\x1b[0m"
+            // Naming `artifact_extensions` here is the difference between a
+            // dead end and a next step (#442): a text format with no extractor
+            // still gets a `files` row when listed there, and a row is what
+            // makes it reachable by `tokensave_files` and by literal search.
+            "\x1b[2m  No extractor is registered for these extensions, so no symbols were \
+             indexed from them.\n  A text format worth searching by path or content \
+             (templates, stylesheets, configs) can be added to \"artifact_extensions\" in \
+             .tokensave/config.json — tracked by path, never parsed.\n  Rerun with --doctor \
+             (or --verbose) for the full list.\x1b[0m"
         );
     }
 }

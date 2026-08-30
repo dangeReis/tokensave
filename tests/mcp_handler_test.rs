@@ -4,6 +4,7 @@
 //! ensuring that the MCP dispatch layer formats results correctly.
 
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use tempfile::TempDir;
 use tokensave::config::{load_config, save_config};
@@ -515,6 +516,11 @@ async fn test_status() {
     assert!(
         text.contains("server"),
         "status should include server stats"
+    );
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        payload["project_root"],
+        json!(cg.project_root().to_string_lossy())
     );
 }
 
@@ -2573,6 +2579,205 @@ async fn test_gini_default_metric() {
     );
 }
 
+/// Runs `tokensave_gini` at `scope: "file"` and returns the outliers as a
+/// name-to-value map.
+async fn gini_file_values(
+    cg: &TokenSave,
+    metric: &str,
+    args: serde_json::Value,
+) -> BTreeMap<String, i64> {
+    let mut payload = json!({ "metric": metric, "scope": "file" });
+    if let (Some(dst), Some(src)) = (payload.as_object_mut(), args.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    let result = handle_tool_call(cg, "tokensave_gini", payload, None, None)
+        .await
+        .unwrap();
+    let text = extract_text(&result.value);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    parsed["outliers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no outliers for metric '{}', got: {}", metric, text))
+        .iter()
+        .map(|o| {
+            (
+                o["name"].as_str().unwrap().to_string(),
+                o["value"].as_f64().unwrap().round() as i64,
+            )
+        })
+        .collect()
+}
+
+/// #422: the arm summed `end_line - start_line + 1` over every node in the
+/// file, so one physical line was counted once per enclosing node — and the
+/// `file` node's own full span was one of the terms, so each file's length was
+/// added on top of the symbols inside it.
+#[tokio::test]
+async fn test_gini_file_scope_lines_is_the_files_own_length() {
+    let (dir, cg) = setup_project().await;
+    let values = gini_file_values(&cg, "lines", json!({})).await;
+    assert!(!values.is_empty(), "expected per-file line counts");
+
+    for (file, reported) in &values {
+        let actual = std::fs::read_to_string(dir.path().join(file))
+            .unwrap()
+            .lines()
+            .count() as i64;
+        assert_eq!(
+            *reported, actual,
+            "{file}: reported {reported} lines against an actual {actual}"
+        );
+    }
+
+    // The control: src/utils.rs holds two functions, so a sum over every node
+    // would exceed its length. If this fixture ever loses its nested symbols
+    // the assertion above stops being able to fail.
+    let utils = values.get("src/utils.rs").copied().unwrap_or_default();
+    let symbol_span_sum = gini_symbol_values(&cg, "lines")
+        .await
+        .iter()
+        .filter(|(k, _)| k.starts_with("src/utils.rs:"))
+        .map(|(_, v)| *v)
+        .sum::<i64>();
+    assert!(
+        symbol_span_sum > 0 && utils > symbol_span_sum,
+        "fixture must have symbols whose spans sum to less than the file \
+         (file {utils}, symbols {symbol_span_sum})"
+    );
+}
+
+/// #423: the file-scope fan arms mapped edge endpoints to files using only the
+/// path-filtered nodes, so an edge from outside the prefix resolved to nothing
+/// and was dropped — a scoped file's fan-in counted only its intra-prefix
+/// callers, while the comment above the query states the opposite intent and
+/// the whole-graph edge load exists to serve it.
+#[tokio::test]
+async fn test_gini_file_scope_fan_in_counts_callers_outside_the_path() {
+    let (_dir, cg) = setup_project().await;
+
+    // `helper` lives in src/utils.rs and is called from tests/test_utils.rs,
+    // which is outside the prefix.
+    let unscoped = gini_file_values(&cg, "fan_in", json!({})).await;
+    let scoped = gini_file_values(&cg, "fan_in", json!({"path": "src"})).await;
+
+    let utils_unscoped = unscoped.get("src/utils.rs").copied().unwrap();
+    let utils_scoped = scoped.get("src/utils.rs").copied().unwrap();
+    assert_eq!(
+        utils_scoped, utils_unscoped,
+        "a scoped file's fan-in must count its callers wherever they live"
+    );
+
+    // Scoping still restricts which files are *ranked*, which is the half of
+    // the behaviour that was already right.
+    assert!(
+        scoped.keys().all(|f| f.starts_with("src/")),
+        "only files inside the prefix may be ranked, got {:?}",
+        scoped.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        unscoped.keys().any(|f| f.starts_with("tests/")),
+        "the unscoped call must still rank files outside src/"
+    );
+}
+
+/// Runs `tokensave_gini` at `scope: "symbol"` and returns the outliers as a
+/// name-to-value map. Every metric here is a count, so the values are integral.
+async fn gini_symbol_values(cg: &TokenSave, metric: &str) -> BTreeMap<String, i64> {
+    let result = handle_tool_call(
+        cg,
+        "tokensave_gini",
+        json!({ "metric": metric, "scope": "symbol" }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let text = extract_text(&result.value);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    parsed["outliers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no outliers for metric '{}', got: {}", metric, text))
+        .iter()
+        .map(|o| {
+            (
+                o["name"].as_str().unwrap().to_string(),
+                o["value"].as_f64().unwrap().round() as i64,
+            )
+        })
+        .collect()
+}
+
+/// #417: at `scope: "symbol"` only `members` had an arm of its own, so `lines`,
+/// `fan_in` and `fan_out` fell through to the catch-all and returned per-symbol
+/// complexity under the name of the metric that was asked for.
+#[tokio::test]
+async fn test_gini_symbol_scope_distinguishes_metrics() {
+    let (_dir, cg) = setup_project().await;
+    let complexity = gini_symbol_values(&cg, "complexity").await;
+    for metric in ["lines", "fan_in", "fan_out"] {
+        let values = gini_symbol_values(&cg, metric).await;
+        assert_ne!(
+            values, complexity,
+            "'{}' at symbol scope returned complexity",
+            metric
+        );
+    }
+}
+
+/// The values themselves, on the four functions of the fixture project.
+#[tokio::test]
+async fn test_gini_symbol_scope_values() {
+    let (_dir, cg) = setup_project().await;
+
+    // Line spans, straight from the fixture sources.
+    assert_eq!(
+        gini_symbol_values(&cg, "lines").await,
+        BTreeMap::from([
+            ("src/main.rs:main".to_string(), 4),
+            ("src/utils.rs:helper".to_string(), 3),
+            ("src/utils.rs:format_greeting".to_string(), 3),
+            ("tests/test_utils.rs:test_helper".to_string(), 1),
+        ])
+    );
+
+    // `helper` is reached four times: a `use` and a call from each of main.rs
+    // and tests/test_utils.rs. `main` is never referenced.
+    assert_eq!(
+        gini_symbol_values(&cg, "fan_in").await,
+        BTreeMap::from([
+            ("src/utils.rs:helper".to_string(), 4),
+            ("src/utils.rs:format_greeting".to_string(), 1),
+            ("tests/test_utils.rs:test_helper".to_string(), 1),
+            ("src/main.rs:main".to_string(), 0),
+        ])
+    );
+
+    // `format_greeting` only calls `format!`, which is not a node.
+    assert_eq!(
+        gini_symbol_values(&cg, "fan_out").await,
+        BTreeMap::from([
+            ("src/utils.rs:helper".to_string(), 1),
+            ("src/main.rs:main".to_string(), 1),
+            ("tests/test_utils.rs:test_helper".to_string(), 1),
+            ("src/utils.rs:format_greeting".to_string(), 0),
+        ])
+    );
+
+    // The arms this change did not touch: every fixture function has the same
+    // complexity, and `members` counts struct and class members, not functions.
+    assert_eq!(
+        gini_symbol_values(&cg, "complexity").await,
+        BTreeMap::from([
+            ("src/main.rs:main".to_string(), 1),
+            ("src/utils.rs:helper".to_string(), 1),
+            ("src/utils.rs:format_greeting".to_string(), 1),
+            ("tests/test_utils.rs:test_helper".to_string(), 1),
+        ])
+    );
+}
+
 // ---------------------------------------------------------------------------
 // tokensave_dependency_depth
 // ---------------------------------------------------------------------------
@@ -2605,6 +2810,60 @@ async fn test_dependency_depth() {
 // ---------------------------------------------------------------------------
 // tokensave_health
 // ---------------------------------------------------------------------------
+
+/// Builds a project holding one real function plus a comment-only shell
+/// script of `filler_lines` lines, and returns the `equality` dimension of
+/// `tokensave_health`.
+async fn equality_with_filler(filler_lines: usize) -> f64 {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::write(
+        project.join("main.rs"),
+        "fn main() {\n    if true {\n        let _ = 1;\n    }\n}\n",
+    )
+    .unwrap();
+    let filler: String = (0..filler_lines)
+        .map(|i| format!("# filler {i}\n"))
+        .collect();
+    fs::write(project.join("notes.sh"), filler).unwrap();
+
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_health",
+        json!({"detailed": true}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+    parsed["dimensions"]["equality"]["score"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no equality score in {parsed}"))
+}
+
+/// #422: `compute_health_snapshot` summed each node's line span into per-file
+/// complexity, including the `file` node's own full span. A file with no
+/// extracted symbols therefore scored its own length as complexity, so the
+/// `equality` dimension moved when a comment-only file got longer.
+#[tokio::test]
+async fn test_health_equality_ignores_a_symbol_free_files_length() {
+    let short = equality_with_filler(20).await;
+    let long = equality_with_filler(400).await;
+    assert!(
+        (short - long).abs() < 1e-9,
+        "a symbol-free file's length must not affect equality: \
+         20 lines gave {short}, 400 lines gave {long}"
+    );
+    // The control: the dimension is live, not a constant the assertion above
+    // would pass against trivially.
+    assert!(
+        short > 0.0 && short < 1.0,
+        "equality should be a real coefficient, got {short}"
+    );
+}
 
 #[tokio::test]
 async fn test_health_summary() {

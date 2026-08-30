@@ -15,7 +15,7 @@ Everything runs locally. Your code never leaves your machine.
 3. [Connecting to Your Agent](#connecting-to-your-agent)
 4. [Exploring Your Codebase from the CLI](#exploring-your-codebase-from-the-cli)
 5. [Keeping the Index Fresh](#keeping-the-index-fresh)
-6. [The Embedded File Watcher](#the-embedded-file-watcher)
+6. [How the MCP Server Refreshes the Index](#how-the-mcp-server-refreshes-the-index)
 7. [Checking Your Setup with Doctor](#checking-your-setup-with-doctor)
 8. [Finding Affected Tests](#finding-affected-tests)
 9. [MCP Tools for AI Agents](#mcp-tools-for-ai-agents)
@@ -184,6 +184,21 @@ rules, set `exclude` globs in `.tokensave/config.json`:
 
 `tokensave init --skip-folder <dir>` writes to that same list.
 
+#### Indexing hidden directories
+
+By default, tokensave prunes all hidden directories (dot-prefixed) during the file walk to avoid indexing massive dependency and config folders (like `.venv`, `.cargo`, or `.next`).
+
+If your project contains code in hidden directories (e.g., `.github/scripts/`), you must explicitly opt-in via the `include` array in `.tokensave/config.json`. **Crucially, you must include both the directory and its contents**, because the walker prunes at the directory level before glob matching happens:
+
+```json
+{
+  "include": [
+    ".github",
+    ".github/**"
+  ]
+}
+```
+
 ---
 
 ## Connecting to Your Agent
@@ -235,6 +250,8 @@ tokensave install --git-hook yes   # install the hook without asking
 tokensave install --git-hook no    # skip the hook without asking
 tokensave install --git-hook default  # preserve the interactive prompt (default when flag is omitted)
 ```
+
+To remove the hooks again, see [Removing the git hooks](#removing-the-git-hooks).
 
 Each agent gets an appropriate configuration: MCP server registration, tool permissions (where the agent supports them), and prompt rules in the agent's instruction file.
 
@@ -353,6 +370,25 @@ During `tokensave install`, you'll be offered a global git `post-commit` hook. I
 
 If you're scripting the install (CI, dotfiles bootstrap, onboarding playbook), pass `--git-hook yes` to install the hook without prompting, or `--git-hook no` to skip it. Omitting the flag preserves the interactive prompt.
 
+#### Removing the git hooks
+
+The hooks are global and outlive every agent integration, so removing tokensave from your agents does not stop them on its own (#420). Two ways to remove them:
+
+```bash
+tokensave githooks              # show what is installed, and where
+tokensave githooks off          # remove tokensave's hooks
+tokensave uninstall             # removes the hooks along with all agent integrations
+tokensave uninstall --keep-git-hooks   # ...or keep them
+```
+
+Removal is deliberately conservative:
+
+- A hook file that contains anything you wrote keeps that content, and loses only tokensave's marked section.
+- A hook file that is nothing but tokensave's own content is deleted.
+- `core.hooksPath` is unset, and the hooks directory removed, only when it is tokensave's own default (`~/.config/git/hooks`), it is left empty, and this run actually removed a tokensave hook. A path you configured yourself is never touched.
+
+If the directory still holds hooks tokensave did not write, it is left in place and the command says so.
+
 You can also set it up manually:
 
 **Global (all repos):**
@@ -371,32 +407,160 @@ cp scripts/post-commit .git/hooks/post-commit
 chmod +x .git/hooks/post-commit
 ```
 
-### Embedded file watcher
+### The MCP server
 
-When you start the tokensave MCP server (e.g. via your agent), it watches the project directory and syncs automatically. See the next section.
+When you start the tokensave MCP server (e.g. via your agent), it refreshes the index on demand as you use it. See the next section.
 
 ---
 
-## The Embedded File Watcher
+## How the MCP Server Refreshes the Index
 
-When you start the tokensave MCP server (e.g. via your agent), it watches
-the project directory for file changes and automatically runs incremental
-syncs in the background. The watcher's lifetime is bound to the MCP
-process — when the agent exits, the watcher exits.
+The server keeps the index fresh on demand rather than by watching the
+filesystem, in two places:
+
+- **When the server connects**, a catch-up sync reconciles changes made
+  while no server was running.
+- **At the start of every MCP tool call**, a staleness check walks the
+  project tree — the same gitignore-aware walk `tokensave sync` uses — and
+  re-indexes what changed. That check is gated by a 30-second cooldown, so
+  calls inside the same window cost at most one walk.
+
+So an edit is picked up by the next tool call once the cooldown has
+elapsed, not the moment you save. If you need the index current sooner,
+run `tokensave sync`.
+
+There is no background watcher and no daemon. `tokensave serve` embedded an
+OS-level watcher from 6.0.0, when daemon mode was removed, until `f7f7c9b`
+removed it in 6.1.1 (#80); the CHANGELOG entry for that release attributes the
+removal to CPU and memory pressure on large monorepos. The watcher is older
+than the embedding: `ProjectWatcher` arrived in 3.5.0, driven then by the
+daemon and the CLI. The on-demand model is its replacement.
 
 Multiple MCP servers on the same project (e.g. two agents) coordinate via
 a per-project sync lock: only one sync runs at a time.
 
-Configure the debounce interval in `~/.tokensave/config.toml`:
+### What an automatic sync will not do
 
-```toml
-watcher_debounce = "15s"
+Both refreshes above are *automatic* — you did not ask for them — so they
+are bounded, and they decline rather than run in two cases:
+
+- **The project has no indexed files.** Building the first index is
+  `tokensave init`'s job: it is explicit, it reports progress, and you chose
+  the directory. A background task will not index a project from scratch by
+  inference. Without this, a server started in a directory that was never
+  initialised would try to index the whole tree — on a home directory that
+  reached tens of gigabytes of memory before anyone noticed (#396).
+- **More than `max_auto_sync_files` files are stale** (default 2000). The
+  30-second cooldown bounds how *often* a sync runs, never what one costs,
+  so the file count is capped separately.
+- **The working tree has moved to a different branch than the server is
+  serving.** A running server resolves its branch once, at startup, so a
+  `git checkout` underneath it does not change which database it holds.
+  Syncing then would write the new branch's files into the old branch's
+  index, which is how `main` ends up holding a file that only ever existed
+  on `feature` (#400). While the drift lasts, local graph tools also refuse
+  to answer from the old branch's index: the call fails with an error naming
+  both branches and the recovery action. Restart the MCP server to serve the
+  new branch; `tokensave_status` stays callable so you can see what is being
+  served. This applies only to projects using per-branch databases — a
+  single-index project is unaffected by a checkout.
+
+Either way the server prints what it skipped and what to run. `tokensave sync`
+is deliberately unbounded and is the supported way to index a large change on
+purpose. To change the ceiling, set `max_auto_sync_files` in
+`.tokensave/config.json`; `0` disables the file-count check (the empty-index
+guard always applies).
+
+The `watcher_debounce` setting in `~/.tokensave/config.toml` is left over
+from that watcher. It is still accepted, but nothing reads it, and the
+30-second cooldown is not configurable.
+
+### Interrupting a sync
+
+`Ctrl-C` and `kill` stop a sync in progress rather than waiting for it to
+finish. A sync polls for the request in the phases that dominate its runtime —
+the parallel extraction pass and the per-file write loop — so on a large tree
+it stops in well under a second instead of minutes.
+
+Stopping is always safe. The index keeps its stale marker, so the next sync
+redoes the abandoned work, and the sync lock is released so that next sync can
+run at all. What the message tells you is how far it got:
+
+- *"no partial results were committed"* — it stopped before anything was
+  written.
+- *"partway through writing"* — some files were updated and others were not.
+  This is the same state a power cut would leave, and the next `tokensave
+  sync` resolves it.
+
+An MCP server is subject to the same thing: a `kill` during its automatic
+catch-up sync now takes effect during the sync rather than after it.
+
+### Index scope warnings
+
+A `serve` warns on stderr, once at startup, about an index whose *scope* looks
+wrong rather than whose contents do:
+
+- **Your home directory is initialised as a project.** Every server started
+  there indexes your whole home tree. This is reported wherever you are
+  standing, because the whole problem with this state is that nobody is
+  standing in it when it does the damage (#450).
+- **The index is larger than 5 GB.** A server maps the whole file.
+
+Both are warnings, not refusals, and the server starts normally. An index that
+already exists is a working setup, and refusing it retroactively would decide
+for you which of your projects stop working. If you meant it, set
+`suppress_scope_warning: true` in `.tokensave/config.json` to stop being told.
+`tokensave doctor` reports the same two conditions and ignores the switch.
+
+### Orphaned servers
+
+On Unix, a `serve` whose launching process has died exits on its own within
+about 30 seconds. A host that exits without closing the server's stdin used to
+leave the server running indefinitely with its whole index mapped, to be found
+and killed by hand (#450). This covers a *dead* parent only; duplicate servers
+under a still-live host are a host-side problem (#436).
+
+### Strict mode: refuse worktree content mismatches
+
+Branch drift is now refused by default (see the sync safeguards above), so
+`strict_tree` remains relevant only to the separate different-worktree
+mismatch described here: the index belongs to a **different git worktree**
+than the one you are in. Branch drift, where the server is serving a
+**different branch** than your working tree is on, no longer needs the
+opt-in (see
+[BRANCHING-USER-GUIDE.md](BRANCHING-USER-GUIDE.md#how-syncing-interacts-with-branches)).
+
+For a different git worktree, tokensave answers with a warning by default,
+or refuses when `strict_tree` is enabled.
+
+For worktree-heavy or branch-heavy workflows, a warning may not be enough. An
+agent rule that says "always check tokensave before reading files" inherits the
+wrong-tree answer with no signal anything is off, and an empty result reads as
+"no such symbol" rather than "wrong tree". If a wrong answer is worse than no
+answer for you, set `strict_tree` in `.tokensave/config.json`:
+
+```json
+{
+  "strict_tree": true
+}
 ```
+
+Every `tokensave_*` tool then **fails** with an error naming both trees (or both
+branches) and the remedy, instead of answering. `tokensave_status` stays
+callable so you can still see what is being served and why the refusal
+happened.
+
+It stays off by default deliberately: sharing one index across a family of
+worktrees is a legitimate setup, and turning that into a hard error without
+being asked would be a bad surprise. Nothing new is detected when you enable
+it — the same conditions were already detected, this only changes whether they
+warn or refuse.
+
 
 ### CLI-Only Workflows
 
-If you don't keep an agent attached, the watcher is not running. Use a
-git post-commit hook to refresh the index on commit:
+If you don't keep an agent attached, no MCP server is running to refresh the
+index. Use a git post-commit hook to refresh it on commit:
 
 ```bash
 cp scripts/post-commit .git/hooks/post-commit
@@ -423,7 +587,7 @@ Then remove the entry matching your install:
 - Linux: `systemctl --user disable --now tokensave-daemon && rm ~/.config/systemd/user/tokensave-daemon.service`
 - Windows: `sc.exe delete tokensave-daemon` (from an elevated terminal)
 
-Once your agent is attached, the embedded watcher takes over automatically.
+Once your agent is attached, the MCP server keeps the index fresh on its own.
 
 ---
 
@@ -496,13 +660,55 @@ When running as an MCP server, tokensave exposes more than 80 tools that AI agen
 | Tool | What it does |
 |------|-------------|
 | `tokensave_context` | Given a task description, returns relevant symbols, relationships, and code snippets. This is the go-to starting point for any coding task. |
-| `tokensave_search` | Find symbols by name. Supports filtering by kind (function, class, method, etc.). |
+| `tokensave_search` | Find symbols by name. Supports filtering by kind (function, class, method, etc.), or `literal: true` for an exact-substring scan of file contents. |
 | `tokensave_node` | Get full details for a specific symbol: source code, location, complexity metrics, and relationships. |
 | `tokensave_files` | List indexed files, optionally filtered by directory or glob pattern. |
 | `tokensave_status` | Index statistics: file counts, symbol counts, language distribution, and tokens saved. |
 | `tokensave_annotations` | Attribute/annotation/decorator introspection: histogram of all annotations in the project, or per-site listings filtered by name, file, or target kind. |
 | `tokensave_doc` | Companion Markdown documentation for a source file: the doc's content, every file it covers, and whether the code changed after the doc was last touched. Often answers the question without reading the file at all. |
 | `tokensave_dependencies` | Package-manifest introspection across 17 ecosystems: workspace summary with license surface and version drift, per-package lookup, and per-member listings. |
+
+#### Literal search: finding strings, not symbols
+
+`tokensave_search` with `literal: true` is a different question from the
+default: an exact-substring, case-sensitive scan of file *contents*, which
+finds text that lives inside function bodies and never appears in a symbol
+name -- a runtime error message, a feature-flag key, a route. Each hit is
+reported as `file` / `line` / `text`, plus the innermost symbol enclosing it
+(`enclosing: null` where there is none).
+
+It reads bytes and needs no parser, but it scans the files the index holds, so
+its reach is the index's reach. A file gets indexed when a language extractor
+handles its extension **or** when the extension is listed in
+`artifact_extensions` (see the artifacts section in `README.md`). A tracked
+`.html` template or `.css` stylesheet is usually neither, and templates and
+stylesheets are exactly where a flag's user-facing label or a CSS class
+actually lives -- so add those extensions to `artifact_extensions` and run
+`tokensave sync -f` if you want "where is this string used" answered across
+them.
+
+When a literal search could not reach every tracked file, the response carries
+an `unscanned` block giving the number of files and a per-extension breakdown,
+so a partial answer is never mistaken for a complete one:
+
+```json
+{
+  "literal": true, "query": "someFlag", "count": 1,
+  "matches": [ { "file": "config/index.js", "line": 1, "text": "..." } ],
+  "unscanned": {
+    "files": 2,
+    "extensions": [ { "extension": "html", "files": 1 },
+                    { "extension": "css", "files": 1 } ],
+    "reason": "The index holds no row for these tracked files, ...",
+    "remedy": "... add its extension to `artifact_extensions` ..."
+  }
+}
+```
+
+Files you excluded yourself are not reported there: config `exclude` globs,
+project query-ignore rules, and the call's own `path_include`/`path_exclude`
+and scope prefix all apply to the report as well as to the scan, so it names
+only files you asked about and the index could not answer for.
 
 ### Navigating relationships
 
@@ -519,7 +725,8 @@ When running as an MCP server, tokensave exposes more than 80 tools that AI agen
 
 | Tool | What it does |
 |------|-------------|
-| `tokensave_dead_code` | Find unreachable symbols — functions with no callers. |
+| `tokensave_dead_code` | Find unreachable symbols — functions with no callers. Symbols that are a candidate for an ambiguous call are excluded, since "maybe called" is not "uncalled". |
+| `tokensave_ambiguous_calls` | List call sites where several targets tied and no edge was created, with each candidate's name, kind, file, and line. |
 | `tokensave_unused_imports` | Find import statements that are never referenced. |
 | `tokensave_circular` | Detect circular file dependencies. |
 | `tokensave_recursion` | Detect recursive and mutually-recursive call cycles. |
@@ -826,7 +1033,7 @@ The `config.toml` is plain TOML and fully transparent:
 
 ```toml
 upload_enabled = true        # set to false to stop uploading
-watcher_debounce = "2s"      # debounce for the embedded MCP file watcher
+watcher_debounce = "2s"      # inert; left over from the watcher removed in 6.1.1
 extraction_timeout_secs = 60 # per-file extraction timeout
 wildcard_permissions = false # true = grant Claude Code tools via one "mcp__tokensave__*" entry
 ```
@@ -871,7 +1078,7 @@ The initial full index of a large project can take a few seconds. This is normal
 
 - Subsequent syncs are incremental and much faster
 - Use `tokensave sync` (not `--force`) for day-to-day updates
-- The post-commit hook and the embedded MCP watcher run in the background so they never block you
+- The post-commit hook syncs in the background so it never blocks you; the MCP server's staleness walk runs inline on a tool call, at most once every 30 seconds
 
 ### Stale install warning
 

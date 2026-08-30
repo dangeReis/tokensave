@@ -175,20 +175,17 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
     // First-run notice (check BEFORE any config save creates the file)
     let is_first_run = tokensave::user_config::UserConfig::is_fresh();
 
-    // Best-effort flush of pending worldwide counter tokens.
-    // `matches!` borrows `command` temporarily; the borrow is dropped
-    // before the `match command` move below, so this compiles.
-    let is_force_flush = matches!(
-        command,
-        Commands::Init { .. } | Commands::Sync { .. } | Commands::Status { .. }
-    );
+    // Best-effort flush of pending worldwide counter tokens. Which command is
+    // running no longer affects this: `try_flush` gates on one daily interval
+    // shared by every upload path, so `init`/`sync`/`status` no longer force an
+    // attempt the other commands would have skipped.
     let mut user_config = tokensave::user_config::UserConfig::load();
     // Skip the worldwide-counter flush on hot startup paths. `try_flush`
     // makes a synchronous HTTP call (#84) which can add seconds to
     // `tokensave serve` startup on slow networks — long enough to blow the
     // MCP client's 30 s `initialize` timeout.
     if !skip_agent_install_maintenance {
-        global::try_flush(&mut user_config, is_force_flush);
+        global::try_flush(&mut user_config);
     }
     user_config.save();
 
@@ -232,6 +229,13 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             // install: keep the per-agent setup banners off stderr so they
             // don't appear on every `init`/`sync` (#255).
             tokensave::agents::set_quiet_install(true);
+            // Captured before the resync, which advances both markers.
+            let resynced_from = if user_config.last_installed_version.is_empty() {
+                user_config.previous_version.clone()
+            } else {
+                user_config.last_installed_version.clone()
+            };
+            let agent_count = user_config.installed_agents.len();
             let outcome =
                 tokensave::agents::resync_installed_agents(&mut user_config, running, |id| {
                     let Ok(ag) = tokensave::agents::get_integration(id) else {
@@ -251,6 +255,15 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                 });
             tokensave::agents::set_quiet_install(false);
             if outcome.ran {
+                // Say what this was and why (#419). The user did not ask for an
+                // install — they may well have run a read-only query — so a
+                // write to their agent config has to name itself. Before this,
+                // the only output was a bare `✔ Wrote <path>` escaping from the
+                // file layer, which read as though the query had done it.
+                eprintln!(
+                    "\x1b[32m✔\x1b[0m {}",
+                    resync_summary(running, &resynced_from, agent_count)
+                );
                 if let Some(warning) = tokensave::agents::cargo_build_binary_warning(&bin) {
                     eprintln!("{warning}");
                 }
@@ -341,6 +354,10 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             doctor,
             verbose,
         } => {
+            // An explicit sync is unbounded by design and can run for minutes
+            // on a large tree; Ctrl-C must stop it at the next phase boundary
+            // rather than at the end (#450).
+            tokensave::cancel::install_signal_handlers();
             let project_path = tokensave::config::resolve_path_with_discovery(path);
             if !TokenSave::is_initialized(&project_path) {
                 eprintln!(
@@ -418,6 +435,9 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     result.files_removed,
                     result.duration_ms
                 ));
+                if let Some(warning) = cg.warn_skipped_hidden_dirs() {
+                    eprintln!("{warning}");
+                }
                 if !result.skipped_paths.is_empty() {
                     eprintln!();
                     eprintln!(
@@ -604,6 +624,7 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                         &country_flags,
                         branch_info.as_ref(),
                         cost_info.as_ref(),
+                        Some(cg.project_root()),
                     );
                 } else {
                     tokensave::display::print_status_table(
@@ -614,6 +635,7 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                         &country_flags,
                         branch_info.as_ref(),
                         cost_info.as_ref(),
+                        Some(cg.project_root()),
                         details,
                     );
                 }
@@ -856,7 +878,11 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                 }
             }
         }
-        Commands::Uninstall { agent, local } => {
+        Commands::Uninstall {
+            agent,
+            local,
+            keep_git_hooks,
+        } => {
             let home = tokensave::agents::home_dir().ok_or_else(|| {
                 tokensave::errors::TokenSaveError::Config {
                     message: "could not determine home directory".to_string(),
@@ -917,6 +943,18 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     user_cfg.installed_agents.clear();
                     user_cfg.save();
                     eprintln!("All agent integrations removed.");
+                    // #420: the global post-commit hook outlives every agent
+                    // integration, so without this a commit in any repo
+                    // recreates the index the user just deleted. --local never
+                    // touches it: the hooks are global, not project-scoped.
+                    if keep_git_hooks {
+                        eprintln!(
+                            "  Global git hooks left in place (--keep-git-hooks). \
+                             Remove them later with `tokensave githooks off`."
+                        );
+                    } else {
+                        report_hook_removal(&tokensave::agents::remove_git_hooks());
+                    }
                 }
             }
         }
@@ -1002,6 +1040,19 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                 }
             };
 
+            // Set the shutdown flag the instant a signal arrives, rather than
+            // only when the run loop next looks. The loop's own SIGTERM stream
+            // is polled only while it waits for a request, so a signal
+            // delivered during a long sync would otherwise not be observed
+            // until that sync finished (#450).
+            tokensave::cancel::install_signal_handlers();
+            watch_for_orphaning();
+            // An index whose *scope* is wrong is still a valid index, so this
+            // warns and continues rather than refusing: retroactively applying
+            // #396's cap would decide which of the user's existing setups stop
+            // working. `suppress_scope_warning` opts out (#450).
+            tokensave::index_scope::warn_on_serve(cg.project_root());
+
             // Memory instrumentation for #253: mark this process as a
             // long-lived MCP server and take a baseline RSS sample.
             tokensave::memstats::init("serve", cg.project_root());
@@ -1028,6 +1079,27 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             }
             server.run(&mut transport).await?;
             server.shutdown().await;
+            // Exit explicitly rather than unwinding out of `main` (#450/#436).
+            //
+            // `tokio::io::stdin()` performs its reads on a blocking thread,
+            // and a blocking task cannot be cancelled — so the outstanding
+            // read is still parked when the run loop leaves. Dropping the
+            // runtime waits for it, and under a supervisor that holds our
+            // stdin open it never completes: the server ran its whole
+            // graceful shutdown, printed its summary, and then sat there
+            // alive and unkillable by anything short of `SIGKILL`. That is
+            // the reported "kill did nothing" and the servers that "never
+            // exit" under a live parent.
+            //
+            // Shutdown has already persisted counters and checkpointed the
+            // WAL, and is idempotent, so there is nothing left to unwind for.
+            // Flush stdout first: a response written just before a signal
+            // must still reach the client.
+            {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            std::process::exit(0);
         }
         Commands::Upgrade { kill } => {
             tokensave::upgrade::run_upgrade(kill)?;
@@ -1063,6 +1135,30 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             config.save();
             eprintln!("Worldwide counter upload enabled.");
         }
+        Commands::Githooks { action } => match action.as_deref() {
+            Some("off") => {
+                report_hook_removal(&tokensave::agents::remove_git_hooks());
+            }
+            Some("on") => {
+                let bin = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "tokensave".to_string());
+                tokensave::agents::offer_git_post_commit_hook(
+                    &bin,
+                    tokensave::agents::GitHookMode::Yes,
+                );
+            }
+            Some(other) => {
+                return Err(tokensave::errors::TokenSaveError::Config {
+                    message: format!("unknown action '{other}': expected 'on' or 'off'"),
+                });
+            }
+            None => {
+                for line in tokensave::agents::describe_git_hooks() {
+                    eprintln!("{line}");
+                }
+            }
+        },
         Commands::Gitignore { path, action } => {
             let project_path = tokensave::config::resolve_path(path);
             let mut config = tokensave::config::load_config(&project_path)?;
@@ -1123,7 +1219,6 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             }
 
             let since = tokensave::accounting::metrics::parse_range(&range);
-            let tokens_saved = gdb.global_tokens_saved().await.unwrap_or(0);
             let droid_present = ingest_stats.coverage.iter().any(|coverage| {
                 coverage.agent == "droid"
                     && coverage.state != tokensave::accounting::CoverageState::Absent
@@ -1131,7 +1226,6 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             let summary = tokensave::accounting::metrics::cost_summary_with_droid_presence(
                 &gdb,
                 since,
-                tokens_saved,
                 droid_present,
             )
             .await;
@@ -1151,6 +1245,15 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                             "total_cost_usd": s.total_cost,
                             "total_input_tokens": s.total_input_tokens,
                             "total_output_tokens": s.total_output_tokens,
+                            // Cache reads and writes are priced, and they dominate
+                            // agent traffic. Without them the exported tokens
+                            // cannot account for the exported cost (#472).
+                            "total_cache_read_tokens": s.total_cache_read_tokens,
+                            "total_cache_creation_tokens": s.total_cache_write_tokens,
+                            "total_tokens": s.total_input_tokens
+                                + s.total_output_tokens
+                                + s.total_cache_read_tokens
+                                + s.total_cache_write_tokens,
                             "tokens_saved": s.tokens_saved,
                             "efficiency_ratio": s.efficiency_ratio,
                             "by_model": s.by_model.iter().map(|(m, c, t)| serde_json::json!({"model": m, "cost": c, "tokens": t})).collect::<Vec<_>>(),
@@ -1257,7 +1360,7 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                 let today_breakdown = gdb
                     .token_breakdown_since(today_since)
                     .await
-                    .unwrap_or((0, 0, 0));
+                    .unwrap_or((0, 0, 0, 0));
 
                 let fmt_row = |label: &str, cost: f64, input: u64, output: u64, cache_read: u64| {
                     let input_s = tokensave::display::format_token_count(input);
@@ -1430,6 +1533,58 @@ fn should_skip_agent_install_maintenance(command: &Commands) -> bool {
     )
 }
 
+/// Print what `remove_git_hooks` did. Says so explicitly when it found
+/// nothing, so `githooks off` never exits silently on a machine that has no
+/// tokensave hooks installed.
+fn report_hook_removal(r: &tokensave::agents::HookRemoval) {
+    if r.found_nothing() {
+        eprintln!(
+            "  No tokensave git hooks found in {}",
+            r.hooks_dir.display()
+        );
+        return;
+    }
+    for p in &r.deleted {
+        eprintln!("\x1b[32m✔\x1b[0m Removed git hook {}", p.display());
+    }
+    for p in &r.cleaned {
+        eprintln!(
+            "\x1b[32m✔\x1b[0m Removed tokensave section from {} (your own hook content kept)",
+            p.display()
+        );
+    }
+    if r.hooks_path_unset {
+        eprintln!("\x1b[32m✔\x1b[0m Unset git core.hooksPath");
+    } else if r.dir_kept_for_foreign_files {
+        eprintln!(
+            "  Left {} and core.hooksPath in place — the directory still holds hooks tokensave did not write",
+            r.hooks_dir.display()
+        );
+    }
+}
+
+/// The one line the silent upgrade resync prints when it has written agent
+/// config (#419).
+///
+/// The user did not ask for an install — they may have run a read-only query
+/// like `tokensave gitignore` — so a write to their agent config has to name
+/// itself and say why. Before this, the only output was a bare `✔ Wrote
+/// <path>` escaping from the file layer, which read as though the query had
+/// done it.
+fn resync_summary(running: &str, previous: &str, agent_count: usize) -> String {
+    let from = if previous.is_empty() {
+        "version not recorded"
+    } else {
+        previous
+    };
+    let agents = if agent_count == 1 {
+        "1 agent".to_string()
+    } else {
+        format!("{agent_count} agents")
+    };
+    format!("Refreshed agent config for tokensave {running} (was {from}) — {agents}")
+}
+
 fn server_disabled_from_env(canonical: Option<&str>, legacy: Option<&str>) -> bool {
     match canonical {
         Some("true") => true,
@@ -1441,6 +1596,34 @@ fn server_disabled_from_env(canonical: Option<&str>, legacy: Option<&str>) -> bo
 #[cfg(test)]
 mod startup_tests {
     use super::{server_disabled_from_env, should_skip_agent_install_maintenance, Commands};
+
+    /// #419: the resync used to announce itself only as `✔ Wrote <path>` from
+    /// the file layer, under a command the user had run as a query.
+    #[test]
+    fn resync_summary_names_the_versions_and_the_scale() {
+        let s = super::resync_summary("7.10.0", "7.9.0", 3);
+        assert_eq!(
+            s,
+            "Refreshed agent config for tokensave 7.10.0 (was 7.9.0) — 3 agents"
+        );
+        // A path, which is what the old message consisted of, must not be the
+        // whole story any more.
+        assert!(!s.contains(".claude"));
+    }
+
+    #[test]
+    fn resync_summary_handles_one_agent_and_an_unrecorded_previous_version() {
+        assert_eq!(
+            super::resync_summary("7.10.0", "7.9.0", 1),
+            "Refreshed agent config for tokensave 7.10.0 (was 7.9.0) — 1 agent"
+        );
+        // `last_installed_version` and `previous_version` are both empty on an
+        // install that predates the markers, and the line still has to read.
+        assert_eq!(
+            super::resync_summary("7.10.0", "", 2),
+            "Refreshed agent config for tokensave 7.10.0 (was version not recorded) — 2 agents"
+        );
+    }
 
     #[test]
     fn canonical_server_disable_env_controls_serve() {
@@ -1492,6 +1675,7 @@ mod startup_tests {
             &Commands::Uninstall {
                 agent: Some("kiro".to_string()),
                 local: false,
+                keep_git_hooks: false,
             }
         ));
     }
@@ -1654,3 +1838,44 @@ mod cost_tests {
         );
     }
 }
+
+/// Exit when the process that launched us is gone (#450, defect 3 of the #396
+/// triage).
+///
+/// A `serve` whose host died keeps its index mapped and keeps answering
+/// nothing, because stdin never reaches EOF once the parent's end of the pipe
+/// is inherited elsewhere — the reported servers survived their supervisor and
+/// had to be found by hand. A reparented process is unambiguous on Unix: its
+/// parent becomes PID 1 (or whatever subreaper adopts it), never the PID it
+/// started with.
+///
+/// This is deliberately *not* a fix for #436, where every surplus server has a
+/// live parent and there is no dead-parent signal to key on.
+#[cfg(unix)]
+fn watch_for_orphaning() {
+    /// Slow on purpose. An orphan wastes memory until it is noticed, which is
+    /// a minute-scale problem, not a second-scale one, and this polls for the
+    /// entire life of every server.
+    const POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let original = std::os::unix::process::parent_id();
+    // A server already started by PID 1 (a launchd/systemd unit) has no parent
+    // to lose, and would otherwise exit on its first tick.
+    if original <= 1 {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(POLL).await;
+            if std::os::unix::process::parent_id() != original {
+                eprintln!("[tokensave] parent process {original} is gone; shutting down");
+                tokensave::cancel::request();
+                return;
+            }
+        }
+    });
+}
+
+/// No reparenting signal to watch for off Unix.
+#[cfg(not(unix))]
+fn watch_for_orphaning() {}

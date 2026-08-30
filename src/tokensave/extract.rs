@@ -89,10 +89,23 @@ pub(crate) fn extract_files_in_process(
     files
         .par_iter()
         .filter_map(|file_path| {
+            // Cheapest place to observe a shutdown: the parallel extraction
+            // pass is the long phase of a large sync, and a per-file atomic
+            // load is nothing against reading and parsing a source file
+            // (#450). Files already extracted are simply dropped by the
+            // caller's cancellation check — the sync leaves through `Err`
+            // with the dirty sentinel still in place.
+            if crate::cancel::is_requested() {
+                return None;
+            }
             let abs_path = project_root.join(file_path);
             let source = sync::read_source_file(&abs_path).ok()?;
-            let extractor =
-                crate::project_manifest::resolve_extractor(registry, project_root, file_path)?;
+            let extractor = crate::project_manifest::resolve_extractor_for_source(
+                registry,
+                project_root,
+                file_path,
+                &source,
+            )?;
             let mut result = safe_extract(extractor, file_path, &source)?;
             result.sanitize();
             let hash = sync::content_hash(&source);

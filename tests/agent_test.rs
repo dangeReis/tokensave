@@ -13,7 +13,7 @@ use common::{make_install_ctx, make_install_ctx_with_real_bin};
 #[test]
 fn test_get_all_integrations() {
     let all = all_integrations();
-    assert_eq!(all.len(), 20);
+    assert_eq!(all.len(), 21);
 }
 
 #[test]
@@ -36,11 +36,12 @@ fn test_available_integrations() {
     assert!(ids.contains(&"kimi"));
     assert!(ids.contains(&"vibe"));
     assert!(ids.contains(&"grok"));
+    assert!(ids.contains(&"omp"));
     assert!(ids.contains(&"pi"));
     assert!(ids.contains(&"plank"));
     assert!(ids.contains(&"qwen"));
     assert!(ids.contains(&"auggie"));
-    assert_eq!(ids.len(), 20);
+    assert_eq!(ids.len(), 21);
 }
 
 #[test]
@@ -63,6 +64,7 @@ fn test_get_integration_valid() {
         "kimi",
         "vibe",
         "grok",
+        "omp",
         "pi",
         "plank",
         "auggie",
@@ -222,7 +224,10 @@ fn test_gemini_install_creates_config() {
     let gemini_md = home.join(".gemini/GEMINI.md");
     assert!(gemini_md.exists(), "GEMINI.md should exist after install");
     let md_content = std::fs::read_to_string(&gemini_md).unwrap();
-    assert!(md_content.contains("tokensave"));
+    assert!(
+        md_content.contains("<!-- tokensave rules begin"),
+        "rules should use the managed marker block"
+    );
 }
 
 #[test]
@@ -255,7 +260,10 @@ fn test_qwen_install_creates_config() {
     let qwen_md = home.join(".qwen/QWEN.md");
     assert!(qwen_md.exists(), "QWEN.md should exist after install");
     let md_content = std::fs::read_to_string(&qwen_md).unwrap();
-    assert!(md_content.contains("tokensave"));
+    assert!(
+        md_content.contains("<!-- tokensave rules begin"),
+        "rules should use the managed marker block"
+    );
 }
 
 #[test]
@@ -314,7 +322,10 @@ fn test_kimi_install_creates_config() {
     let agents_md = home.join(".kimi/AGENTS.md");
     assert!(agents_md.exists(), "AGENTS.md should exist after install");
     let md_content = std::fs::read_to_string(&agents_md).unwrap();
-    assert!(md_content.contains("tokensave"));
+    assert!(
+        md_content.contains("<!-- tokensave rules begin"),
+        "rules should use the managed marker block"
+    );
 }
 
 #[test]
@@ -609,7 +620,10 @@ fn test_vibe_install_creates_config() {
         "Vibe prompt should exist after install"
     );
     let prompt = std::fs::read_to_string(&prompt_path).unwrap();
-    assert!(prompt.contains("tokensave"));
+    assert!(
+        prompt.contains("<!-- tokensave rules begin"),
+        "rules should use the managed marker block"
+    );
 }
 
 // ---------------------------------------------------------------------------

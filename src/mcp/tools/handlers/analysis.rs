@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::errors::{Result, TokenSaveError};
 use crate::tokensave::TokenSave;
-use crate::types::{NodeKind, Visibility};
+use crate::types::NodeKind;
 
 use super::super::ToolResult;
 use super::{
@@ -419,6 +419,88 @@ pub(super) async fn handle_dead_code(
     })
 }
 
+/// Handles `tokensave_ambiguous_calls` tool calls (#412).
+///
+/// Surfaces the ties the resolver refused to guess at. Each candidate is
+/// returned with the detail needed to choose between them — name, kind, file
+/// and line — because the caller is a model with the source in front of it and
+/// can read the receiver's type, which the resolver cannot.
+pub(super) async fn handle_ambiguous_calls(
+    cg: &TokenSave,
+    args: Value,
+    scope_prefix: Option<&str>,
+) -> Result<ToolResult> {
+    let path_prefix = effective_path(&args, scope_prefix);
+    let limit = args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(25, |v| v.min(200) as usize);
+
+    let ambiguous = cg.db().get_ambiguous_calls(path_prefix, limit).await?;
+
+    // One batched lookup for every candidate across every site, rather than a
+    // query per site.
+    let candidate_ids: Vec<String> = ambiguous
+        .iter()
+        .flat_map(|a| a.candidate_node_ids.iter().cloned())
+        .collect();
+    let candidates = cg.db().get_nodes_by_ids(&candidate_ids).await?;
+    let by_id: HashMap<&str, &crate::types::Node> =
+        candidates.iter().map(|n| (n.id.as_str(), n)).collect();
+
+    let mut touched_files: Vec<String> = Vec::new();
+    let items: Vec<Value> = ambiguous
+        .iter()
+        .map(|a| {
+            touched_files.push(a.file_path.clone());
+            let options: Vec<Value> = a
+                .candidate_node_ids
+                .iter()
+                .filter_map(|id| by_id.get(id.as_str()))
+                .map(|n| {
+                    touched_files.push(n.file_path.clone());
+                    json!({
+                        "id": n.id,
+                        "name": n.name,
+                        "kind": n.kind.as_str(),
+                        "file": n.file_path,
+                        "line": super::display_line(n.start_line),
+                        "qualified_name": n.qualified_name,
+                    })
+                })
+                .collect();
+            json!({
+                "call_site": {
+                    "from_node_id": a.from_node_id,
+                    "file": a.file_path,
+                    "line": super::display_line(a.line),
+                },
+                "reference": a.reference_name,
+                "candidates": options,
+            })
+        })
+        .collect();
+
+    touched_files.sort();
+    touched_files.dedup();
+
+    let output = json!({
+        "ambiguous_call_count": items.len(),
+        "note": "These call sites produce no `calls` edge, so they are absent from \
+                 callers/callees/impact, and their candidates are excluded from \
+                 dead_code. Pick the intended target from the receiver's type.",
+        "ambiguous_calls": items,
+    });
+
+    let formatted = serde_json::to_string_pretty(&output).unwrap_or_default();
+    Ok(ToolResult {
+        value: json!({
+            "content": [{ "type": "text", "text": truncate_response(&formatted) }]
+        }),
+        touched_files,
+    })
+}
+
 /// Handles `tokensave_module_api` tool calls.
 pub(super) async fn handle_module_api(
     cg: &TokenSave,
@@ -429,22 +511,14 @@ pub(super) async fn handle_module_api(
         message: "missing required parameter: path".to_string(),
     })?;
 
-    let all_nodes = cg.get_all_nodes().await?;
+    // Public nodes under `path`, selected in SQL rather than by loading the
+    // whole node table and discarding the rest (#410).
+    let scoped = cg
+        .db()
+        .get_nodes_filtered(&crate::db::NodeFilter::new().path_prefix(path).public_only())
+        .await?;
 
-    // Filter to nodes in matching files (exact path or directory prefix)
-    let prefix = if path.ends_with('/') {
-        path.to_string()
-    } else {
-        format!("{path}/")
-    };
-
-    let mut pub_nodes: Vec<&crate::types::Node> = all_nodes
-        .iter()
-        .filter(|n| {
-            n.visibility == Visibility::Pub
-                && (n.file_path == path || n.file_path.starts_with(&prefix))
-        })
-        .collect();
+    let mut pub_nodes: Vec<&crate::types::Node> = scoped.iter().collect();
 
     pub_nodes.sort_by(|a, b| {
         a.file_path
@@ -583,22 +657,11 @@ pub(super) async fn handle_hotspots(
         .map_or(10, |v| v.min(100) as usize);
     debug_assert!(limit > 0, "handle_hotspots limit must be positive");
 
-    let all_edges = cg.get_all_edges().await?;
-
-    // Count incoming + outgoing edges per node
-    let mut connectivity: HashMap<String, (usize, usize)> = HashMap::new();
-    for edge in &all_edges {
-        connectivity.entry(edge.source.clone()).or_insert((0, 0)).1 += 1; // outgoing
-        connectivity.entry(edge.target.clone()).or_insert((0, 0)).0 += 1; // incoming
-    }
-
-    // Sort by total connectivity descending
-    let mut sorted: Vec<(String, usize, usize)> = connectivity
-        .into_iter()
-        .map(|(id, (inc, out))| (id, inc, out))
-        .collect();
-    sorted.sort_by_key(|x| std::cmp::Reverse(x.1 + x.2));
-    sorted.truncate(limit);
+    // Degrees are tallied, sorted and truncated in SQL. Loading all 25,580
+    // edges here to emit at most `limit` rows — 10 by default, 100 at most —
+    // was #418's clearest case. The path filters below still run afterwards on
+    // the same rows they always did, so the result set is unchanged.
+    let sorted: Vec<(String, u32, u32)> = cg.db().get_top_degree_nodes(limit).await?;
 
     // Resolve node details
     let mut items: Vec<Value> = Vec::new();
@@ -684,23 +747,14 @@ pub(super) async fn handle_unused_imports(
         &cfg.default_path_exclude,
     );
 
-    let all_nodes = cg.get_all_nodes().await?;
+    // `Use` nodes under the requested path, selected in SQL (#410).
+    let mut use_filter = crate::db::NodeFilter::new().kinds(&[NodeKind::Use]);
+    if let Some(prefix) = path_prefix {
+        use_filter = use_filter.path_prefix(prefix);
+    }
+    let scoped_uses = cg.db().get_nodes_filtered(&use_filter).await?;
 
-    // Find all Use nodes
-    let use_nodes: Vec<&crate::types::Node> = all_nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::Use)
-        .filter(|n| {
-            path_prefix.is_none_or(|prefix| {
-                let with_slash = if prefix.ends_with('/') {
-                    prefix.to_string()
-                } else {
-                    format!("{prefix}/")
-                };
-                n.file_path.starts_with(&with_slash) || n.file_path == prefix
-            })
-        })
-        .collect();
+    let use_nodes: Vec<&crate::types::Node> = scoped_uses.iter().collect();
     let use_nodes = filter_by_path_lists(use_nodes, &path_include, &path_exclude, |n| &n.file_path);
 
     let mut unused: Vec<Value> = Vec::new();
@@ -1462,12 +1516,16 @@ fn dfs_cycle_path<'a>(
 /// score reported by `tokensave_complexity`.
 async fn test_reached_node_ids(cg: &TokenSave) -> Result<HashSet<String>> {
     use crate::types::EdgeKind;
-    let all_nodes = cg.get_all_nodes().await?;
-    let all_edges = cg.get_all_edges().await?;
-    let node_to_file: HashMap<String, String> = all_nodes
-        .iter()
-        .map(|n| (n.id.clone(), n.file_path.clone()))
-        .collect();
+    // `calls` only, selected in SQL: every use below filters on the kind, and
+    // `calls` is 19,282 of this repository's 25,580 edges, so the rest was a
+    // quarter of the load carried and discarded (#418).
+    let all_edges = cg.db().get_edges_by_kind(EdgeKind::Calls).await?;
+    // Graph-wide id -> file_path, projected in SQL (#411). Every node is
+    // needed, because a `Calls` edge can originate anywhere and the question
+    // is whether its *source* lives in a test file — but the other twenty-six
+    // columns never are. This was the last `get_all_nodes()` call site in the
+    // handlers whose load was pure overhead.
+    let node_to_file: HashMap<String, String> = cg.db().get_node_paths().await?;
     let call_source_ids: Vec<String> = all_edges
         .iter()
         .filter(|e| e.kind == EdgeKind::Calls)
@@ -2006,6 +2064,21 @@ pub(super) async fn handle_diagnostics(cg: &TokenSave, args: Value) -> Result<To
 // tokensave_constructors
 // ---------------------------------------------------------------------------
 
+/// Does this file's language build values with `Name { ... }` literals?
+///
+/// Rust and Go do; Python (`Name(...)`), Java (`new Name(...)`), Ruby and the
+/// rest do not, and against those the literal scan is guaranteed to find
+/// nothing (#458). C#'s `new Name { ... }` is an object *initializer* over an
+/// already-constructed value, not a whole-value literal, so a missing-fields
+/// list read off it would mean something different from what this tool
+/// promises — it is excluded on purpose.
+fn literal_syntax_is_supported(file_path: &str) -> bool {
+    matches!(
+        file_path.rsplit('.').next().unwrap_or_default(),
+        "rs" | "go"
+    )
+}
+
 pub(super) async fn handle_constructors(
     cg: &TokenSave,
     args: Value,
@@ -2042,6 +2115,43 @@ pub(super) async fn handle_constructors(
                 "content": [{ "type": "text", "text": format!("No struct, class, or case-class named '{struct_name}' found.") }]
             }),
             touched_files: vec![],
+        });
+    }
+
+    // The literal scan looks for `Name { ... }`, which is Rust's and Go's
+    // construction syntax and nobody else's: Python builds with
+    // `Name(...)`, Java with `new Name(...)`. Against those the scan finds
+    // nothing and used to report a clean, confident `match_count: 0`, which
+    // is indistinguishable from "this type is never constructed" — a false
+    // negative dressed as an answer, in a tool whose name promises exactly
+    // the question an impact review asks (#458).
+    //
+    // The type's own declaring file decides. Saying "not supported here" is
+    // a refusal the caller can act on; a zero is not.
+    if !struct_nodes
+        .iter()
+        .any(|n| literal_syntax_is_supported(&n.file_path))
+    {
+        let langs: Vec<String> = struct_nodes.iter().map(|n| n.file_path.clone()).collect();
+        let payload = json!({
+            "struct": struct_name,
+            "language_supported": false,
+            "note": format!(
+                "'{struct_name}' is declared in {} — this tool scans for `Name {{ ... }}` \
+                 literal syntax, which only Rust and Go use, so it cannot answer for this \
+                 type. `match_count` and `sites` are omitted deliberately: a zero here \
+                 would be indistinguishable from 'never constructed'. Try \
+                 tokensave_callers_for on the type's constructor, or tokensave_field_sites \
+                 for the individual fields.",
+                langs.join(", ")
+            ),
+        });
+        let formatted = serde_json::to_string_pretty(&payload).unwrap_or_default();
+        return Ok(ToolResult {
+            value: json!({
+                "content": [{ "type": "text", "text": truncate_response(&formatted) }]
+            }),
+            touched_files: Vec::new(),
         });
     }
 
@@ -2109,6 +2219,7 @@ pub(super) async fn handle_constructors(
 
     let payload = json!({
         "struct": struct_name,
+        "language_supported": true,
         "expected_fields": expected_fields.iter().cloned().collect::<Vec<_>>(),
         "match_count": sites.len(),
         "sites": sites,
@@ -2292,6 +2403,14 @@ fn has_disqualifying_prefix(source: &str, idx: usize) -> bool {
     if probe >= 2 && &bytes[probe - 2..probe] == b"->" {
         return true;
     }
+    // Go writes a return type where Rust writes `-> T`: `func f() Settings {`
+    // and `func (s *S) f() Settings {` both put the type between a `)` and the
+    // body's brace. Without this the function's own signature is reported as a
+    // construction site, with a `missing_fields` list naming every field —
+    // advice to "fix" a declaration that constructs nothing (#458).
+    if bytes[probe - 1] == b')' {
+        return true;
+    }
     let id_end = probe;
     let mut id_start = probe;
     while id_start > 0
@@ -2389,9 +2508,97 @@ fn field_name_from_chunk(chunk: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+use super::receiver_type;
+
 // ---------------------------------------------------------------------------
 // tokensave_field_sites
 // ---------------------------------------------------------------------------
+
+/// Declared types of every field the graph holds, keyed `Type::field`, plus
+/// whether `want_type` declares `want_field` at all.
+///
+/// The map is what `receiver_type` follows a chain through; the flag turns a
+/// qualified query naming a nonexistent field into a direct answer rather than
+/// a broad one (#458). Both come from one pass over the field nodes.
+async fn field_type_index(
+    cg: &TokenSave,
+    want_type: &str,
+    want_field: &str,
+) -> (receiver_type::TypeIndex, bool) {
+    let mut index = receiver_type::TypeIndex::default();
+    let mut declared = false;
+    // Scala spells its fields `ValField`/`VarField`; everything else uses
+    // `Field`.
+    let mut nodes = Vec::new();
+    for kind in [
+        crate::types::NodeKind::Field,
+        crate::types::NodeKind::ValField,
+        crate::types::NodeKind::VarField,
+    ] {
+        nodes.extend(cg.db().get_nodes_by_kind(kind).await.unwrap_or_default());
+    }
+    for node in nodes {
+        // `src/types.rs::GraphStats::last_sync_at` -> owner `GraphStats`.
+        let Some(owner) = receiver_type::owning_type(&node.qualified_name) else {
+            continue;
+        };
+        if owner == want_type && node.name == want_field {
+            declared = true;
+        }
+        // `pub last_sync_at: u64` -> `u64`. Without a declared type there is
+        // nothing to follow, so the entry stays absent and a chain through it
+        // reads as unknown rather than as a guess.
+        if let Some((_, ty)) = node.signature.as_deref().and_then(|s| s.rsplit_once(':')) {
+            let ty = receiver_type::normalize_type(ty);
+            if !ty.is_empty() {
+                index.fields.insert(format!("{owner}::{}", node.name), ty);
+            }
+        }
+    }
+
+    // Return types, keyed by bare function name and kept only where every
+    // function of that name agrees — a text scan cannot tell two same-named
+    // methods apart, so a disagreement must leave the name unresolvable
+    // rather than attribute a site to the wrong type.
+    let mut seen: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut callables = Vec::new();
+    for kind in [
+        crate::types::NodeKind::Function,
+        crate::types::NodeKind::Method,
+    ] {
+        callables.extend(cg.db().get_nodes_by_kind(kind).await.unwrap_or_default());
+    }
+    for node in callables {
+        let Some(ret) = node.signature.as_deref().and_then(return_type_of) else {
+            continue;
+        };
+        match seen.get(&node.name) {
+            Some(Some(existing)) if existing != &ret => {
+                seen.insert(node.name.clone(), None);
+            }
+            Some(_) => {}
+            None => {
+                seen.insert(node.name.clone(), Some(ret));
+            }
+        }
+    }
+    for (name, ret) in seen {
+        if let Some(ret) = ret {
+            index.returns.insert(name, ret);
+        }
+    }
+    (index, declared)
+}
+
+/// The declared return type in a signature: `fn f(&self) -> Result<T>` ->
+/// `Result<T>`. Returns `None` for a signature with no return arrow, which is
+/// every language whose functions do not write one.
+fn return_type_of(signature: &str) -> Option<String> {
+    let (_, ret) = signature.split_once("->")?;
+    let ret = ret.trim().trim_end_matches(['{', ';']).trim();
+    (!ret.is_empty()).then(|| ret.to_string())
+}
 
 pub(super) async fn handle_field_sites(
     cg: &TokenSave,
@@ -2419,14 +2626,71 @@ pub(super) async fn handle_field_sites(
     };
 
     let project_root = cg.project_root();
+
+    // Declared types of every field in the graph, keyed `Type::field`. This is
+    // what lets a chain like `self.inner.field` be followed one hop at a time
+    // (#458).
+    let (type_index, declared_on) = match qualifier.as_deref() {
+        Some(q) => field_type_index(cg, receiver_type::bare_type_name(q), &field_name).await,
+        None => (receiver_type::TypeIndex::default(), true),
+    };
+    // A qualified query naming a field the type does not declare is answerable
+    // outright, and answering it with every other type's sites is exactly the
+    // broad-answer-under-a-narrow-heading this tool was reported for.
+    if let (Some(q), false) = (qualifier.as_deref(), declared_on) {
+        let payload = json!({
+            "field": raw,
+            "qualifier": q,
+            "qualifier_applied": true,
+            "write_count": 0,
+            "write_returned": 0,
+            "write_lines": 0,
+            "read_count": 0,
+            "read_returned": 0,
+            "read_lines": 0,
+            "excluded_count": 0,
+            "unattributed_count": 0,
+            "truncated": false,
+            "write_sites": [],
+            "read_sites": [],
+            "qualifier_note": format!(
+                "No field '{field_name}' is declared on '{q}' anywhere in the index, so \
+                 there are no sites to narrow to. Check the type name, or query the bare \
+                 field name '{field_name}' to see every type that declares it."
+            ),
+        });
+        let formatted = serde_json::to_string_pretty(&payload).unwrap_or_default();
+        return Ok(ToolResult {
+            value: json!({
+                "content": [{ "type": "text", "text": truncate_response(&formatted) }]
+            }),
+            touched_files: Vec::new(),
+        });
+    }
+
     // Source-text scan: tracked artifacts have no code constructs to find, so
     // reading them is pure cost (#323).
     let files = cg.get_code_files().await?;
     let mut writes: Vec<Value> = Vec::new();
     let mut reads: Vec<Value> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
+    // Totals are counted over every matching site, not just the ones that fit
+    // under `limit` (#457): a capped page reported as a total understates a
+    // blast radius, which is the one question this tool exists to answer.
+    let mut write_total = 0usize;
+    let mut read_total = 0usize;
+    // Two references to the field on one source line are two sites but one
+    // line. Sites arrive in byte order within a file, so lines ascend and the
+    // previous line is enough to count distinct ones (#457).
+    let mut write_lines = 0usize;
+    let mut read_lines = 0usize;
+    // Sites the qualifier positively ruled out, and sites whose receiver could
+    // not be typed at all. Reported separately: the first is the narrowing
+    // working, the second is the limit of what a source-text scan can know.
+    let mut excluded = 0usize;
+    let mut unattributed = 0usize;
 
-    'outer: for file in &files {
+    for file in &files {
         if let Some(prefix) = scope_prefix {
             let with_slash = if prefix.ends_with('/') {
                 prefix.to_string()
@@ -2442,18 +2706,48 @@ pub(super) async fn handle_field_sites(
             continue;
         };
         let nodes = cg.get_nodes_by_file(&file.path).await.unwrap_or_default();
+        let mut last_write_line: Option<u32> = None;
+        let mut last_read_line: Option<u32> = None;
 
         for site in find_field_references(&source, &field_name) {
             let line_text = line_at(&source, site.byte).unwrap_or("");
-            let enclosing = nodes
+            let enclosing_node = nodes
                 .iter()
                 .filter(|n| {
                     // field sites are 1-based, node spans 0-based (#203)
                     let l0 = site.line.saturating_sub(1);
                     n.start_line <= l0 && l0 <= n.end_line
                 })
-                .min_by_key(|n| n.end_line.saturating_sub(n.start_line))
-                .map(|n| n.qualified_name.clone());
+                .min_by_key(|n| n.end_line.saturating_sub(n.start_line));
+            let enclosing = enclosing_node.map(|n| n.qualified_name.clone());
+
+            // Narrow, when a qualifier was given and the receiver resolves. A
+            // site whose receiver cannot be typed is neither kept nor dropped
+            // silently: it is counted, and the count is reported, so a
+            // narrowed answer never poses as a complete one (#458).
+            if let Some(q) = qualifier.as_deref() {
+                let enc = enclosing_node.map(|n| receiver_type::Enclosing {
+                    qualified_name: n.qualified_name.clone(),
+                    signature: n.signature.clone(),
+                    start_line: n.start_line,
+                    end_line: n.end_line,
+                });
+                // `site.byte` is just past the field name; the receiver ends
+                // at the dot that precedes it.
+                let dot = site.byte - field_name.len() - 1;
+                match receiver_type::attribute_site(&source, dot, q, enc.as_ref(), &type_index) {
+                    receiver_type::Attribution::Matches => {}
+                    receiver_type::Attribution::Excludes => {
+                        excluded += 1;
+                        continue;
+                    }
+                    receiver_type::Attribution::Unknown => {
+                        unattributed += 1;
+                        continue;
+                    }
+                }
+            }
+
             let entry = json!({
                 "file": file.path,
                 "line": site.line,
@@ -2465,31 +2759,45 @@ pub(super) async fn handle_field_sites(
             }
             match site.kind {
                 FieldRefKind::Write => {
-                    writes.push(entry);
-                    if writes.len() >= limit && (writes_only || reads.len() >= limit) {
-                        break 'outer;
+                    write_total += 1;
+                    if last_write_line != Some(site.line) {
+                        write_lines += 1;
+                        last_write_line = Some(site.line);
+                    }
+                    if writes.len() < limit {
+                        writes.push(entry);
                     }
                 }
                 FieldRefKind::Read => {
                     if writes_only {
                         continue;
                     }
-                    reads.push(entry);
-                    if reads.len() >= limit && writes.len() >= limit {
-                        break 'outer;
+                    read_total += 1;
+                    if last_read_line != Some(site.line) {
+                        read_lines += 1;
+                        last_read_line = Some(site.line);
+                    }
+                    if reads.len() < limit {
+                        reads.push(entry);
                     }
                 }
             }
         }
     }
 
-    let qualifier_applied = false;
-    let payload = if writes_only {
+    // The qualifier now narrows for real (#458): a site is kept only when its
+    // receiver resolves to the named type.
+    let qualifier_applied = qualifier.is_some();
+    let truncated = writes.len() < write_total || reads.len() < read_total;
+    let mut payload = if writes_only {
         json!({
             "field": raw,
             "qualifier": qualifier,
             "qualifier_applied": qualifier_applied,
-            "write_count": writes.len(),
+            "write_count": write_total,
+            "write_returned": writes.len(),
+            "write_lines": write_lines,
+            "truncated": truncated,
             "write_sites": writes,
         })
     } else {
@@ -2497,12 +2805,45 @@ pub(super) async fn handle_field_sites(
             "field": raw,
             "qualifier": qualifier,
             "qualifier_applied": qualifier_applied,
-            "write_count": writes.len(),
-            "read_count": reads.len(),
+            "write_count": write_total,
+            "write_returned": writes.len(),
+            "write_lines": write_lines,
+            "read_count": read_total,
+            "read_returned": reads.len(),
+            "read_lines": read_lines,
+            "truncated": truncated,
             "write_sites": writes,
             "read_sites": reads,
         })
     };
+    if let Some(map) = payload.as_object_mut() {
+        if let Some(q) = qualifier.as_deref() {
+            map.insert("excluded_count".to_string(), json!(excluded));
+            map.insert("unattributed_count".to_string(), json!(unattributed));
+            map.insert(
+                "qualifier_note".to_string(),
+                json!(format!(
+                    "Narrowed to '{q}': {excluded} site(s) resolved to a different type and \
+                     were dropped. {unattributed} site(s) could not be attributed to any \
+                     type and are NOT included — a receiver is typed only from an explicit \
+                     declaration, a self/receiver binding, or a declared field type, so a \
+                     value returned by a call or read out of a container stays unknown. \
+                     Treat these counts as a lower bound; query the bare name \
+                     '{field_name}' for the unnarrowed answer."
+                )),
+            );
+        }
+        if truncated {
+            map.insert(
+                "truncation_note".to_string(),
+                json!(format!(
+                    "Site lists were capped at limit={limit}; write_count/read_count \
+                     are the true totals over the whole scan, write_returned/\
+                     read_returned are how many are listed here."
+                )),
+            );
+        }
+    }
     let formatted = serde_json::to_string_pretty(&payload).unwrap_or_default();
     Ok(ToolResult {
         value: json!({
@@ -2524,7 +2865,6 @@ struct FieldSite {
     line: u32,
     kind: FieldRefKind,
 }
-
 fn find_field_references(source: &str, field: &str) -> Vec<FieldSite> {
     let bytes = source.as_bytes();
     let needle = format!(".{field}");

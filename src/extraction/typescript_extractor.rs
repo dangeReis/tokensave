@@ -172,7 +172,13 @@ impl TypeScriptExtractor {
             "export_statement" => Self::visit_export_statement(state, node),
             "function_declaration" => Self::visit_function(state, node),
             "lexical_declaration" => Self::visit_lexical_declaration(state, node),
-            "class_declaration" => Self::visit_class(state, node),
+            // `abstract class` parses as its own node kind, not as a
+            // `class_declaration` with a modifier. Dispatching only on the
+            // latter dropped the class, every method on it, and every edge
+            // into them — and in TypeScript an abstract base is usually where
+            // the shared interface lives, so those are the methods most likely
+            // to be called (#413).
+            "class_declaration" | "abstract_class_declaration" => Self::visit_class(state, node),
             "interface_declaration" => Self::visit_interface(state, node),
             "enum_declaration" => Self::visit_enum(state, node),
             "type_alias_declaration" => Self::visit_type_alias(state, node),
@@ -219,7 +225,11 @@ impl TypeScriptExtractor {
                 let child = cursor.node();
                 match child.kind() {
                     "function_declaration" => Self::visit_function(state, child),
-                    "class_declaration" => Self::visit_class(state, child),
+                    // See `visit_node`: `export abstract class` reaches here
+                    // as `abstract_class_declaration` (#413).
+                    "class_declaration" | "abstract_class_declaration" => {
+                        Self::visit_class(state, child);
+                    }
                     "interface_declaration" => Self::visit_interface(state, child),
                     "enum_declaration" => Self::visit_enum(state, child),
                     "type_alias_declaration" => Self::visit_type_alias(state, child),
@@ -671,6 +681,14 @@ impl TypeScriptExtractor {
                             Self::emit_decorator(state, dec, &id);
                         }
                     }
+                    // `abstract foo(): void;` is its own node kind, and it used
+                    // to fall through the arm below and reach nothing (#424).
+                    "abstract_method_signature" => {
+                        let id = Self::visit_abstract_method(state, child);
+                        for dec in pending_decorators.drain(..) {
+                            Self::emit_decorator(state, dec, &id);
+                        }
+                    }
                     _ => {}
                 }
                 if !cursor.goto_next_sibling() {
@@ -678,6 +696,74 @@ impl TypeScriptExtractor {
                 }
             }
         }
+    }
+
+    /// Extract an `abstract_method_signature` from a class body. A declaration
+    /// with no body still names a callable, and the resolver already accepts
+    /// `AbstractMethod` as a `Calls` target, so it becomes a node of that kind
+    /// rather than being dropped (#424). Returns the node ID so sibling
+    /// decorators can attach to it.
+    fn visit_abstract_method(state: &mut ExtractionState, node: TsNode<'_>) -> String {
+        let name = find_child_by_kind(node, "property_identifier")
+            .map_or_else(|| "<anonymous>".to_string(), |n| state.node_text(n));
+        let text = state.node_text(node);
+        let visibility = Self::extract_ts_accessibility(state, node);
+        let docstring = Self::extract_jsdoc(state, node);
+        let start_line = node.start_position().row as u32;
+        let end_line = node.end_position().row as u32;
+        let start_column = node.start_position().column as u32;
+        let end_column = node.end_position().column as u32;
+        let qualified_name = format!("{}::{}", state.qualified_prefix(), name);
+        let id = generate_node_id(
+            &state.file_path,
+            &NodeKind::AbstractMethod,
+            &name,
+            start_line,
+        );
+
+        let graph_node = Node {
+            id: id.clone(),
+            kind: NodeKind::AbstractMethod,
+            name,
+            qualified_name,
+            file_path: state.file_path.clone(),
+            start_line,
+            attrs_start_line: start_line,
+            end_line,
+            start_column,
+            end_column,
+            signature: Some(text.trim().to_string()),
+            docstring,
+            visibility,
+            is_async: false,
+            branches: 0,
+            loops: 0,
+            returns: 0,
+            max_nesting: 0,
+            unsafe_blocks: 0,
+            unchecked_calls: 0,
+            assertions: 0,
+            cognitive_complexity: 0,
+            distinct_operators: 0,
+            distinct_operands: 0,
+            total_operators: 0,
+            total_operands: 0,
+            updated_at: state.timestamp,
+            parent_id: None,
+        };
+        state.nodes.push(graph_node);
+
+        // Contains edge from parent (the abstract class).
+        if let Some(parent_id) = state.parent_node_id() {
+            state.edges.push(Edge {
+                source: parent_id.to_string(),
+                target: id.clone(),
+                kind: EdgeKind::Contains,
+                line: Some(start_line),
+            });
+        }
+
+        id
     }
 
     /// Extract a `method_definition` from a class body. Returns the method's
@@ -1537,6 +1623,111 @@ impl TypeScriptExtractor {
         map
     }
 
+    /// Records the enclosing class's field types under `this.<field>` keys.
+    ///
+    /// Without this, `this.statusBar.dispose()` had no type to resolve against:
+    /// `collect_var_types` tracked bare `this`, typed parameters and typed
+    /// bindings, but never a field. The call fell through to the bare-name
+    /// fallback, where two classes both defining `dispose` are indistinguishable
+    /// and the winner was whichever the file scan reached first (#378, #412).
+    ///
+    /// The type is right there in the source. Both shapes are read: an
+    /// annotation (`private worker: Beta`, the constructor-injection shape) and
+    /// an initializer (`private statusBar = new StatusBar()`). An annotation
+    /// wins when both are present, since it is the declared intent.
+    fn collect_field_types(
+        state: &ExtractionState,
+        class_body: TsNode<'_>,
+        map: &mut std::collections::HashMap<String, String>,
+    ) {
+        let mut cursor = class_body.walk();
+        if !cursor.goto_first_child() {
+            return;
+        }
+        loop {
+            let member = cursor.node();
+            // A constructor parameter property (`constructor(private worker:
+            // Beta) {}`) declares a field, but the declaration sits in the
+            // parameter list rather than the class body, so the member scan
+            // below never sees it. This is the standard dependency-injection
+            // form, and the one most likely to appear in code where a call on
+            // `this.<field>` needs resolving (#414).
+            if member.kind() == "method_definition"
+                && member
+                    .child_by_field_name("name")
+                    .is_some_and(|n| state.node_text(n) == "constructor")
+            {
+                Self::collect_constructor_param_properties(state, member, map);
+            }
+            if matches!(
+                member.kind(),
+                "public_field_definition" | "property_signature" | "field_definition"
+            ) {
+                if let Some(name) = member.child_by_field_name("name") {
+                    let ty = member
+                        .child_by_field_name("type")
+                        .and_then(|t| Self::normalize_type_name(&state.node_text(t)))
+                        .or_else(|| {
+                            member
+                                .child_by_field_name("value")
+                                .and_then(|v| Self::infer_value_type(state, v))
+                        });
+                    if let Some(ty) = ty {
+                        map.insert(format!("this.{}", state.node_text(name)), ty);
+                    }
+                }
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    /// Records field types declared as constructor parameter properties.
+    ///
+    /// TypeScript treats `constructor(private readonly worker: Beta) {}` as
+    /// both a parameter and a field declaration. The grammar marks the
+    /// accessibility modifier on the parameter, which is what distinguishes a
+    /// property from an ordinary constructor argument — an unmodified
+    /// parameter is local to the constructor and must not become a field.
+    fn collect_constructor_param_properties(
+        state: &ExtractionState,
+        ctor: TsNode<'_>,
+        map: &mut std::collections::HashMap<String, String>,
+    ) {
+        let Some(params) = find_child_by_kind(ctor, "formal_parameters") else {
+            return;
+        };
+        let mut cursor = params.walk();
+        if !cursor.goto_first_child() {
+            return;
+        }
+        loop {
+            let param = cursor.node();
+            let is_property = param.kind() == "required_parameter"
+                && (find_child_by_kind(param, "accessibility_modifier").is_some()
+                    || find_child_by_kind(param, "override_modifier").is_some()
+                    || param
+                        .children(&mut param.walk())
+                        .any(|c| c.kind() == "readonly"));
+            if is_property {
+                if let (Some(pat), Some(ty)) = (
+                    param.child_by_field_name("pattern"),
+                    param.child_by_field_name("type"),
+                ) {
+                    if pat.kind() == "identifier" {
+                        if let Some(tn) = Self::normalize_type_name(&state.node_text(ty)) {
+                            map.insert(format!("this.{}", state.node_text(pat)), tn);
+                        }
+                    }
+                }
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
     /// Recursively records `variable_declarator` types, skipping nested
     /// function scopes.
     fn collect_let_types(
@@ -1599,6 +1790,19 @@ impl TypeScriptExtractor {
                                 let ty = match obj.kind() {
                                     "this" => var_types.get("this").cloned(),
                                     "identifier" => var_types.get(&state.node_text(obj)).cloned(),
+                                    // `this.<field>.method()` — the object is
+                                    // itself a member expression. Looked up
+                                    // under the `this.<field>` key recorded by
+                                    // `collect_field_types` (#412).
+                                    "member_expression" => obj
+                                        .child_by_field_name("object")
+                                        .filter(|inner| inner.kind() == "this")
+                                        .and_then(|_| obj.child_by_field_name("property"))
+                                        .and_then(|field| {
+                                            var_types
+                                                .get(&format!("this.{}", state.node_text(field)))
+                                                .cloned()
+                                        }),
                                     _ => None,
                                 };
                                 if let Some(ty) = ty {
@@ -1637,7 +1841,14 @@ impl TypeScriptExtractor {
         fn_node_id: &str,
     ) {
         let self_type = Self::enclosing_class_type(state);
-        let var_types = Self::collect_var_types(state, fn_node, self_type.as_deref());
+        let mut var_types = Self::collect_var_types(state, fn_node, self_type.as_deref());
+        // Field types of the class this method belongs to, so a call through
+        // `this.<field>` resolves precisely instead of falling through to the
+        // bare-name fallback (#412). The method's parent in the tree is the
+        // class body when there is one; a free function has none.
+        if let Some(class_body) = fn_node.parent().filter(|p| p.kind() == "class_body") {
+            Self::collect_field_types(state, class_body, &mut var_types);
+        }
         Self::emit_typed_method_calls(state, body, fn_node_id, &var_types);
     }
 

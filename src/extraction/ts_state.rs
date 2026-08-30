@@ -6,11 +6,30 @@
 //! per-language state (e.g. C++ access specifiers) keep their own state
 //! structs; everything else shares this one.
 
+use std::collections::HashSet;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tree_sitter::Node as TsNode;
 
 use crate::types::{Edge, ExtractionResult, Node, UnresolvedRef, Visibility};
+
+/// What a Python class body declares. The Python extractor keeps one per
+/// enclosing class so a `self.<name>` read in a value position can be told
+/// apart: a method reference when `name` is a method the class defines and
+/// never binds as an attribute, a field read otherwise. Other extractors
+/// leave the stack empty.
+#[derive(Default)]
+pub(crate) struct PythonClassAttrs {
+    /// Methods defined directly in the class body.
+    pub(crate) methods: HashSet<String>,
+    /// Names bound as attributes: `self.<name> = ...` or `cls.<name> = ...`
+    /// in the class's own methods, or `<name> = ...` in the class body.
+    pub(crate) assigned: HashSet<String>,
+    /// Methods that are descriptors (`@property`, `@cached_property`,
+    /// `@<name>.setter` and friends). An assignment to one invokes it, so
+    /// it does not shadow the method.
+    pub(crate) descriptors: HashSet<String>,
+}
 
 /// Internal state used during AST traversal.
 pub(crate) struct ExtractionState {
@@ -26,9 +45,22 @@ pub(crate) struct ExtractionState {
     /// Nesting depth of enclosing class-like scopes (used by extractors that
     /// treat top-level and member functions differently; others leave it 0).
     pub(crate) class_depth: usize,
+    /// One entry per enclosing Python class, innermost last. See
+    /// [`PythonClassAttrs`]. Other extractors leave it empty.
+    pub(crate) python_class_attrs: Vec<PythonClassAttrs>,
     /// Current Ruby visibility mode inside a class/module body (private/protected/
     /// public switches). Other extractors leave it at the default Pub.
     pub(crate) visibility_mode: Visibility,
+    /// Whether a Ruby `module_function` mode switch is currently active: the
+    /// next `def`s in this module body become a private instance method
+    /// *and* a public singleton method of the same name. A strict companion
+    /// of `visibility_mode` rather than independent state — Ruby treats
+    /// `public`/`private`/`protected`/`module_function` as four values of
+    /// one default-definition-mode frame, each cancelling the previous
+    /// (confirmed against Ruby 3.4.7), so this flag is saved/reset/restored
+    /// at exactly the same sites as `visibility_mode`, and setting either
+    /// one clears the other. Other extractors leave it `false`.
+    pub(crate) module_function_mode: bool,
     /// Node IDs of Ruby singleton methods that belong to the enclosing class
     /// (`def self.foo`, `def obj.foo` where `obj` resolves to `self`/the
     /// enclosing constant), so retroactive visibility (`private_class_method
@@ -69,6 +101,24 @@ pub(crate) struct ExtractionState {
     /// traversal is outside a method or self-retargeting block. Other
     /// extractors leave it `None`.
     pub(crate) ruby_body_call_owner_id: Option<String>,
+    /// Whether the traversal is currently inside a Concern `included`/
+    /// `prepended`/`class_methods` block, where `self` at runtime is the
+    /// includer — a receiver the extractor cannot resolve statically, and
+    /// whose actual type (`Class` vs `Module`) determines whether
+    /// `module_function` even raises (confirmed against Ruby 3.4.7 and
+    /// activesupport 8.1.3.1: `included do; module_function; def a; end;
+    /// end` raises `NameError` for a `Class` includer, but silently
+    /// succeeds — on the includer, not the concern module itself — for a
+    /// `Module` includer). `classify_block_scope`/`visit_block_body`
+    /// attribute a plain `def` inside these blocks to the concern module as
+    /// a deliberate, already-accepted approximation (the includer's actual
+    /// identity is unknowable), but that approximation does not extend to
+    /// `module_function`: its private-instance-plus-public-singleton effect
+    /// depends on which concrete receiver it runs against, not just on
+    /// "some includer exists". So `visit_module_function_directive` treats
+    /// this flag as blocking evidence rather than trying to model it. Other
+    /// extractors leave it `false`.
+    pub(crate) in_concern_self_retargeting_block: bool,
 }
 
 /// Which Ruby singleton scope the traversal is currently inside. `class << expr`
@@ -103,13 +153,16 @@ impl ExtractionState {
             source: source.as_bytes().to_vec(),
             timestamp,
             class_depth: 0,
+            python_class_attrs: Vec::new(),
             visibility_mode: Visibility::Pub,
+            module_function_mode: false,
             singleton_method_ids: Vec::new(),
             foreign_singleton_method_ids: Vec::new(),
             singleton_scope: SingletonScope::Outside,
             in_concern_scope: false,
             self_is_instance: false,
             ruby_body_call_owner_id: None,
+            in_concern_self_retargeting_block: false,
         }
     }
 

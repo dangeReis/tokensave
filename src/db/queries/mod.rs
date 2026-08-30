@@ -13,6 +13,7 @@ mod files;
 mod fingerprints;
 mod metadata;
 mod nodes;
+pub use nodes::NodeFilter;
 mod search;
 pub(crate) use search::to_fts_match_query;
 mod stats;
@@ -284,7 +285,7 @@ pub(crate) fn display_language_for_path(path: &str) -> &'static str {
         "swift" => "Swift",
         "as" => "ActionScript",
         "c" | "h" => "C",
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "C++",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "inl" | "ipp" | "tcc" => "C++",
         "cs" => "C#",
         "fs" | "fsi" | "fsx" => "F#",
         "fst" | "fsti" => "F*",

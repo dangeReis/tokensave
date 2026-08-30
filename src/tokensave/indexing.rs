@@ -298,6 +298,10 @@ impl TokenSave {
         // `begin_bulk_load` can fail while another process holds the table
         // lock, and clearing first would leave the project with an empty index
         // that the MCP server then keeps serving (#320).
+        // Before the destructive step, not after: `clear()` empties the index
+        // and a shutdown observed a moment later would leave nothing to serve
+        // until the next sync. Leaving here costs the caller nothing (#450).
+        crate::cancel::check("index")?;
         self.db.begin_bulk_load().await?;
         self.db.clear().await?;
 
@@ -321,6 +325,10 @@ impl TokenSave {
         let (files, artifact_files) = Self::partition_artifacts(files, &self.artifact_extensions());
         let (extractions, _skipped) =
             extract_files_isolated(&project_root, registry, files.clone());
+        // Extraction stops early on a shutdown, so a short result here means
+        // abandoned work, not an empty project. Committing it would write a
+        // partial graph that looks complete.
+        crate::cancel::check("index")?;
 
         // 4. Collect all data
         let mut all_nodes = Vec::new();
@@ -393,6 +401,12 @@ impl TokenSave {
         // 5. Resolve references in-memory (parallel) before DB insert
         let phase_start = Instant::now();
         crate::memstats::set_graph_nodes(all_nodes.len() as u64);
+        // Last point before anything is written in the full-index path: the
+        // inserts all happen after resolution, so leaving here still commits
+        // nothing (#450). Resolution itself is a single whole-graph pass with
+        // no safe interior seam, hence the check in front of it rather than
+        // inside it.
+        crate::cancel::check("index")?;
         if !all_unresolved.is_empty() {
             // #253: `from_nodes` borrows from `all_nodes` rather than
             // cloning it into its caches; the remaining peak here is
@@ -400,6 +414,14 @@ impl TokenSave {
             crate::memstats::record("index:resolve:build_caches");
             let resolver = ReferenceResolver::from_nodes(&self.db, &all_nodes);
             let resolution = resolver.resolve_all(&all_unresolved);
+            // Ties are recorded rather than dropped, so a caller can pick the
+            // intended target and `dead_code` can tell "referenced, target
+            // unknown" from "uncalled" (#412).
+            let ambiguity_files: Vec<String> = self.scan_files();
+            let _ = self
+                .db
+                .replace_ambiguous_calls(&ambiguity_files, &resolution.ambiguous)
+                .await;
             all_edges.extend(resolver.create_edges(&resolution.resolved));
             // Propagate call edges across build-config variants (Rust `#[cfg]`
             // twins, Go platform files) so an inactive-platform definition is
@@ -473,6 +495,7 @@ impl TokenSave {
         let now_str = current_timestamp().to_string();
         self.db.set_metadata("last_full_sync_at", &now_str).await?;
         self.db.set_metadata("last_sync_at", &now_str).await?;
+        self.touch_branch_synced();
         self.db
             .set_metadata("last_sync_duration_ms", &duration_ms.to_string())
             .await?;
@@ -580,11 +603,12 @@ impl TokenSave {
 
     /// Like `sync_if_stale` but treats lock contention as success.
     ///
-    /// Use this from the embedded MCP watcher when another MCP (or any peer
-    /// process) already holds the project sync lock. If the peer holds the
-    /// lock, wait (bounded) for it to release so the DB is fresh by the time
-    /// the caller refreshes its view; if the peer covered our files, return
-    /// without doing extra work, otherwise sync ourselves.
+    /// Use this from the MCP server's connect-time catch-up and its per-call
+    /// staleness check, when another MCP (or any peer process) already holds
+    /// the project sync lock. If the peer holds the lock, wait (bounded) for
+    /// it to release so the DB is fresh by the time the caller refreshes its
+    /// view; if the peer covered our files, return without doing extra work,
+    /// otherwise sync ourselves.
     pub async fn sync_if_stale_silent(&self, stale_files: &[String]) -> Result<()> {
         if stale_files.is_empty() {
             return Ok(());
@@ -601,7 +625,7 @@ impl TokenSave {
             lock
         } else {
             // Peer is syncing. Wait for them to release the lock so the
-            // caller (e.g. the embedded watcher's refresh hook) sees the
+            // caller (e.g. the MCP server's refresh hook) sees the
             // post-sync DB state — returning early here leaves the caller
             // refreshing against pre-sync data and silently dropping the
             // update on the floor.
@@ -724,13 +748,24 @@ impl TokenSave {
             self.db.insert_edges(&owned).await?;
         }
 
+        crate::cancel::check_partial("sync")?;
+
         // Resolve references for any new/changed unresolved refs
         if !file_paths.is_empty() {
-            // #253: `from_nodes` now borrows rather than clones; the
-            // remaining peak is `get_all_nodes` materializing the whole
-            // graph at once (#306).
+            // #253: `from_nodes` borrows rather than clones. #306: the load
+            // drops `docstring` and `signature`, which resolution never
+            // reads and which are unbounded TEXT — a const's whole
+            // initializer lives in `signature` (43 KB for one node in
+            // #362). The remaining peak is the node count itself: the
+            // resolver borrows from this slice for its whole life and needs
+            // a global name index, so the pass cannot be chunked without a
+            // redesign.
             crate::memstats::record("sync:resolve:load_nodes");
-            let all_nodes = self.db.get_all_nodes().await.unwrap_or_default();
+            let all_nodes = self
+                .db
+                .get_all_nodes_for_resolution()
+                .await
+                .unwrap_or_default();
             crate::memstats::set_graph_nodes(all_nodes.len() as u64);
             crate::memstats::record("sync:resolve:build_caches");
             let resolver = ReferenceResolver::from_nodes(&self.db, &all_nodes);
@@ -738,12 +773,27 @@ impl TokenSave {
             let unresolved = self.db.get_unresolved_refs().await?;
             if !unresolved.is_empty() {
                 let resolution = resolver.resolve_all(&unresolved);
+                // See the full-index site: ambiguities are kept, not dropped.
+                let ambiguity_files: Vec<String> = self.scan_files();
+                let _ = self
+                    .db
+                    .replace_ambiguous_calls(&ambiguity_files, &resolution.ambiguous)
+                    .await;
                 let edges = resolver.create_edges(&resolution.resolved);
                 if !edges.is_empty() {
                     self.db.insert_edges(&edges).await?;
                     // Re-propagate build-variant call edges over the full graph
                     // now that new call edges exist (#141).
-                    let all_db_edges = self.db.get_all_edges().await.unwrap_or_default();
+                    // Only the two kinds `propagate_variant_edges` reads, not
+                    // the whole table (#418). The `calls` half is irreducible
+                    // for this algorithm — any call into a variant member
+                    // matters — but type_of, returns, uses, implements, extends
+                    // and receives were all carried and never looked at.
+                    let all_db_edges = self
+                        .db
+                        .get_edges_by_kinds(&[EdgeKind::Annotates, EdgeKind::Calls])
+                        .await
+                        .unwrap_or_default();
                     let variant_edges =
                         crate::resolution::propagate_variant_edges(&all_nodes, &all_db_edges);
                     if !variant_edges.is_empty() {
@@ -757,6 +807,7 @@ impl TokenSave {
         self.db
             .set_metadata("last_sync_at", &current_timestamp().to_string())
             .await?;
+        self.touch_branch_synced();
         self.db
             .set_metadata(
                 "last_sync_duration_ms",
@@ -799,6 +850,7 @@ impl TokenSave {
         write_dirty_sentinel(&self.project_root);
         let start = Instant::now();
 
+        crate::cancel::check("sync")?;
         on_progress(0, 0, "scanning files");
         let phase_start = Instant::now();
         let (current_files, skipped_extensions) = self.scan_files_diagnostics();
@@ -826,6 +878,8 @@ impl TokenSave {
             file_stats.len(),
             phase_start.elapsed().as_secs_f64()
         ));
+
+        crate::cancel::check("sync")?;
 
         // Load all DB file records into a map for O(1) lookups
         let db_files = self.db.get_all_files().await?;
@@ -999,6 +1053,10 @@ impl TokenSave {
         // so the user can see them in `tokensave sync --doctor`.
         skipped.extend(sync_skipped);
 
+        // Extraction is the long phase and stops early on a shutdown, so this
+        // is the last point at which nothing has been written yet (#450).
+        crate::cancel::check("sync")?;
+
         // Phase 1: insert all nodes (and metadata) so cross-file edges
         // can reference them. Edges are queued for phase 2 (#58).
         let total = sync_extractions.len();
@@ -1007,6 +1065,11 @@ impl TokenSave {
         let mut queued_edges: Vec<&Edge> = Vec::new();
         let mut body_documents = Vec::new();
         for (idx, (file_path, result, hash, size, mtime)) in sync_extractions.iter().enumerate() {
+            // Past this point rows are being written per file, so an
+            // interruption leaves a partially updated index rather than an
+            // untouched one — reported as such (#450). Checked per file
+            // because on a large tree this loop is minutes of work.
+            crate::cancel::check_partial("sync")?;
             on_progress(idx + 1, total, file_path);
 
             total_nodes += result.nodes.len();
@@ -1067,21 +1130,42 @@ impl TokenSave {
             let phase_start = Instant::now();
             let unresolved = self.db.get_unresolved_refs().await?;
             if !unresolved.is_empty() {
-                // #253: `from_nodes` now borrows rather than clones; the
-                // remaining peak is `get_all_nodes` materializing the whole
-                // graph at once (#306).
+                // #253: `from_nodes` borrows rather than clones. #306: the
+                // load drops `docstring` and `signature`, which resolution
+                // never reads and which are unbounded TEXT. The remaining
+                // peak is the node count itself — see the sibling site in
+                // the incremental path for why it cannot be chunked.
                 crate::memstats::record("sync:resolve:load_nodes");
-                let all_nodes = self.db.get_all_nodes().await.unwrap_or_default();
+                let all_nodes = self
+                    .db
+                    .get_all_nodes_for_resolution()
+                    .await
+                    .unwrap_or_default();
                 crate::memstats::set_graph_nodes(all_nodes.len() as u64);
                 crate::memstats::record("sync:resolve:build_caches");
                 let resolver = ReferenceResolver::from_nodes(&self.db, &all_nodes);
                 crate::memstats::record("sync:resolve:done");
                 let resolution = resolver.resolve_all(&unresolved);
+                // See the full-index site: ambiguities are kept, not dropped.
+                let ambiguity_files: Vec<String> = self.scan_files();
+                let _ = self
+                    .db
+                    .replace_ambiguous_calls(&ambiguity_files, &resolution.ambiguous)
+                    .await;
                 let edges = resolver.create_edges(&resolution.resolved);
                 if !edges.is_empty() {
                     self.db.insert_edges(&edges).await?;
                     // Propagate call edges across build-config variants (#141).
-                    let all_db_edges = self.db.get_all_edges().await.unwrap_or_default();
+                    // Only the two kinds `propagate_variant_edges` reads, not
+                    // the whole table (#418). The `calls` half is irreducible
+                    // for this algorithm — any call into a variant member
+                    // matters — but type_of, returns, uses, implements, extends
+                    // and receives were all carried and never looked at.
+                    let all_db_edges = self
+                        .db
+                        .get_edges_by_kinds(&[EdgeKind::Annotates, EdgeKind::Calls])
+                        .await
+                        .unwrap_or_default();
                     let variant_edges =
                         crate::resolution::propagate_variant_edges(&all_nodes, &all_db_edges);
                     if !variant_edges.is_empty() {
@@ -1101,6 +1185,7 @@ impl TokenSave {
         self.db
             .set_metadata("last_sync_at", &current_timestamp().to_string())
             .await?;
+        self.touch_branch_synced();
         self.db
             .set_metadata("last_sync_duration_ms", &duration_ms.to_string())
             .await?;
@@ -1145,6 +1230,40 @@ impl TokenSave {
         &self,
     ) -> Option<std::sync::Arc<crate::project_manifest::CompiledManifest>> {
         crate::project_manifest::manifest_for(&self.project_root, &self.registry)
+    }
+
+    /// Returns a warning message if git-tracked files in hidden directories were skipped by indexing.
+    pub fn warn_skipped_hidden_dirs(&self) -> Option<String> {
+        detect_skipped_hidden_dirs(
+            &self.project_root,
+            &self.config,
+            self.manifest().as_deref(),
+            &self.registry.supported_extensions(),
+        )
+    }
+
+    /// Advances `last_synced_at` on the branch this handle serves.
+    ///
+    /// Called wherever `last_sync_at` metadata is written, so the DB-level
+    /// timestamp and the per-branch one cannot drift apart. Before #399
+    /// `touch_synced` had a single caller in `branch add`, so the field
+    /// recorded when a branch entry was *created* and never moved again —
+    /// while `tokensave branch list`, `tokensave_branch_list`, and the
+    /// `tokensave://branches` resource all render it as live freshness.
+    ///
+    /// Best-effort: a sync that indexed correctly must not fail because a
+    /// metadata file could not be rewritten. Silent on projects with no
+    /// branch metadata, and on a branch with no entry of its own.
+    fn touch_branch_synced(&self) {
+        let Some(branch) = self.serving_branch.as_ref().or(self.active_branch.as_ref()) else {
+            return;
+        };
+        let dir = get_tokensave_dir(&self.project_root);
+        let Some(mut meta) = branch_meta::load_branch_meta(&dir) else {
+            return;
+        };
+        meta.touch_synced(branch);
+        let _ = branch_meta::save_branch_meta(&dir, &meta);
     }
 
     pub(crate) fn scan_files(&self) -> Vec<String> {
@@ -1444,6 +1563,181 @@ impl TokenSave {
         }
         Some(rel_str)
     }
+}
+
+/// Detects git-tracked, indexable files that the hidden-directory filter
+/// skipped. Returns a formatted warning string if any exist.
+///
+/// Mirrors the walker's pruning rule exactly (`scan_files_walkdir` /
+/// `scan_files_with_gitignore`): a dot-prefixed *directory* blocks descent
+/// unless that directory path itself matches an include glob or manifest
+/// entry. Matching only the files inside (e.g. `.github/**` without a bare
+/// `.github` entry) does not re-enable descent, so this check walks each
+/// ancestor prefix the same way the walker does instead of testing the file
+/// path — otherwise the warning would go silent in exactly that trap.
+/// Every path `git ls-files` reports for the project, as forward-slashed
+/// repository-relative strings.
+///
+/// `None` when the project is not a git repository, git is unavailable, or the
+/// command fails — every caller treats that as "cannot tell" and stays silent
+/// rather than reporting an empty answer as a complete one.
+///
+/// Note that these are *index* entries: a path here may not exist on disk
+/// (sparse checkout, a staged deletion), so callers that care check.
+pub(crate) fn list_git_tracked_files(project_root: &Path) -> Option<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        // -z: NUL-separated output, no C-quoting of non-ASCII paths.
+        .args(["ls-files", "-z"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+pub fn detect_skipped_hidden_dirs(
+    project_root: &Path,
+    config: &TokenSaveConfig,
+    manifest: Option<&crate::project_manifest::CompiledManifest>,
+    supported_exts: &[&str],
+) -> Option<String> {
+    let tracked = list_git_tracked_files(project_root)?;
+
+    let mut dir_counts: HashMap<String, usize> = HashMap::new();
+    // Sibling files share the same verdict, so evaluate the globs once per
+    // parent directory instead of once per file. `Some(prefix)` = the hidden
+    // ancestor the walker would prune at; `None` = reachable or deliberately
+    // excluded.
+    let mut dir_cache: HashMap<String, Option<String>> = HashMap::new();
+
+    for rel_path in tracked.iter().map(String::as_str) {
+        // Only count files an extractor could actually index; otherwise every
+        // repo with a tracked `.github/workflows/*.yml` would warn.
+        let ext = Path::new(rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !supported_exts.contains(&ext) {
+            continue;
+        }
+        // File-level excludes are a deliberate opt-out; including the dir
+        // would not index these files, so warning about them is a false
+        // promise.
+        if is_excluded(rel_path, config) {
+            continue;
+        }
+        // Root-level dotfiles have no hidden ancestor directory.
+        let Some((dirs, _file)) = rel_path.rsplit_once('/') else {
+            continue;
+        };
+
+        let blocked = dir_cache.entry(dirs.to_string()).or_insert_with(|| {
+            // Apply the walker's hidden-directory test at each ancestor prefix.
+            let mut end = 0;
+            for comp in dirs.split('/') {
+                end += comp.len() + usize::from(end > 0);
+                if !comp.starts_with('.') {
+                    continue;
+                }
+                let prefix = &dirs[..end];
+                // Explicitly excluded dirs are a deliberate opt-out, not a trap.
+                if is_excluded_dir(prefix, config) {
+                    return None;
+                }
+                let allowed = is_included(prefix, config)
+                    || manifest.is_some_and(|m| {
+                        m.matches_local_file(prefix) || m.local_dir_may_contain(prefix)
+                    });
+                if !allowed {
+                    return Some(prefix.to_string());
+                }
+            }
+            None
+        });
+        if let Some(prefix) = blocked {
+            // `git ls-files` lists index entries that may not exist on disk
+            // (sparse checkouts, deletions staged but not committed); the
+            // walker never would have seen those, so don't warn about them.
+            if !project_root.join(rel_path).is_file() {
+                continue;
+            }
+            *dir_counts.entry(prefix.clone()).or_insert(0) += 1;
+        }
+    }
+
+    if dir_counts.is_empty() {
+        return None;
+    }
+
+    let total: usize = dir_counts.values().sum();
+    let mut dir_vec: Vec<(String, usize)> = dir_counts.into_iter().collect();
+    dir_vec.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let dir_summary = dir_vec
+        .iter()
+        .map(|(dir, count)| format!("{dir}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let top_dir = &dir_vec[0].0;
+    let file_word = if total == 1 { "file" } else { "files" };
+
+    Some(format!(
+        "\x1b[33mwarning:\x1b[0m skipped {total} tracked {file_word} in hidden directories ({dir_summary}) — add \"{top_dir}\" and \"{top_dir}/**\" to include[] in .tokensave/config.json, then run `tokensave sync -f` to index them (or add \"{top_dir}/**\" to exclude[] to silence this warning)"
+    ))
+}
+
+impl TokenSave {
+    /// Tracked files the index holds no `files` row for, in `git ls-files`
+    /// order.
+    ///
+    /// A file gets a row when a language extractor handles its extension, or
+    /// when the extension is listed in `artifact_extensions` (#323) — and a
+    /// row is what makes a file reachable by literal search, which reads bytes
+    /// and needs no parser. Everything else is tracked by git, invisible to
+    /// the index, and therefore silently absent from a literal answer (#442).
+    ///
+    /// Deliberately *not* filtered by extension: `NON_SOURCE_EXTS` exists to
+    /// keep asset noise out of the skipped-*language* diagnostic and contains
+    /// `txt`, `xml`, `ini`, `conf` and `csv`, which are exactly the text
+    /// formats a literal search might be looking in. Reporting every
+    /// unindexed extension and letting the caller decide which are worth
+    /// adding is honest; filtering them here would recreate the same silent
+    /// gap one level down.
+    ///
+    /// Config `exclude` globs are applied, since an excluded file is a
+    /// deliberate opt-out rather than an omission, and index entries with no
+    /// file on disk (sparse checkouts, staged deletions) are dropped: the
+    /// walker would never have seen those either.
+    ///
+    /// `None` when git cannot answer, so a caller can distinguish "nothing is
+    /// missing" from "cannot tell".
+    pub(crate) fn unindexed_tracked_files(
+        &self,
+        indexed: &std::collections::HashSet<&str>,
+    ) -> Option<Vec<String>> {
+        let tracked = list_git_tracked_files(&self.project_root)?;
+        Some(
+            tracked
+                .into_iter()
+                .filter(|path| !indexed.contains(path.as_str()))
+                .filter(|path| !is_excluded(path, &self.config))
+                .filter(|path| self.project_root.join(path).is_file())
+                .collect(),
+        )
+    }
 
     /// Returns the artifact extensions actually in effect for this project.
     ///
@@ -1564,10 +1858,11 @@ impl TokenSave {
             message: format!("failed to read file {file_path}: {e}"),
         })?;
 
-        let Some(extractor) = crate::project_manifest::resolve_extractor(
+        let Some(extractor) = crate::project_manifest::resolve_extractor_for_source(
             &self.registry,
             &self.project_root,
             file_path,
+            &source,
         ) else {
             return Ok(());
         };

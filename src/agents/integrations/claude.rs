@@ -150,10 +150,8 @@ fn install_global(ctx: &InstallContext) -> Result<()> {
     // install, not be swallowed — silently succeeding here would report
     // install as complete while stale rules text stays stuck in CLAUDE.md.
     uninstall_claude_md_rules(&claude_md_path)?;
-    write_managed_rules_file(
-        &claude_rules_path(&claude_dir),
-        &managed_rules_markdown(RulesVariant::Claude),
-    )?;
+    write_managed_rules_file(&claude_rules_path(&claude_dir), &rules_for_agent("claude")?)
+        .map(|_| ())?;
     install_clean_local_config();
 
     crate::agent_note!();
@@ -183,10 +181,8 @@ fn install_local(ctx: &InstallContext, project: &Path) -> Result<()> {
     write_json_file(&settings_path, &settings)?;
 
     uninstall_claude_md_rules(&claude_md_path)?;
-    write_managed_rules_file(
-        &claude_rules_path(&claude_dir),
-        &managed_rules_markdown(RulesVariant::Claude),
-    )?;
+    write_managed_rules_file(&claude_rules_path(&claude_dir), &rules_for_agent("claude")?)
+        .map(|_| ())?;
     // NB: no install_clean_local_config() — that is the global-only cleanup.
 
     crate::agent_note!();
@@ -871,14 +867,60 @@ fn expected_hook_subcommand(event: &str) -> &'static str {
 
 /// Expected hook matcher for each event, or `None` when the event is unmatched.
 ///
-/// `PreToolUse` runs for `Agent`, `Grep`, and `Bash` — the latter two redirect
-/// symbol-shaped greps to `tokensave_search` / `tokensave_signature_search` /
-/// `tokensave_callers`.
+/// `PreToolUse` runs for `Agent`, `Grep`, `Bash`, and `Glob`. `Grep`/`Bash`
+/// redirect symbol-shaped greps to `tokensave_search` /
+/// `tokensave_signature_search` / `tokensave_callers`; `Glob` and the
+/// `find -name` / `fd --extension` forms that arrive as `Bash` redirect
+/// path-shaped discovery to `tokensave_files` (#294).
+///
+/// `Glob` was missing here until #389, so the handler's `Glob` branch shipped
+/// in 7.9.0 but Claude Code never routed a `Glob` call to the hook and the
+/// branch was unreachable. This is the single source of truth for both the
+/// install path (`install_hook_inner`) and the drift repair
+/// (`doctor_fix_hooks`), so widening it here also migrates existing installs
+/// on their next `install`/`reinstall`.
 fn expected_hook_matcher(event: &str) -> Option<&'static str> {
     match event {
-        "PreToolUse" => Some("Agent|Grep|Bash"),
+        "PreToolUse" => Some("Agent|Grep|Bash|Glob"),
         _ => None,
     }
+}
+
+/// Does the installed matcher already cover every tool tokensave routes?
+///
+/// A user may widen the matcher deliberately — adding a tool they want the
+/// nudge to see. Requiring an exact match meant the next `install` or
+/// `doctor --fix` silently reverted that edit (#452). A superset is not drift:
+/// it covers everything the handler needs, so it is left alone. Anything
+/// narrower is still repaired, which is how the `Glob` widening in #389 reached
+/// existing installs.
+fn matcher_covers_expected(actual: &str, expected: &str) -> bool {
+    let installed: std::collections::HashSet<&str> = actual
+        .split('|')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    expected
+        .split('|')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .all(|tool| installed.contains(tool))
+}
+
+/// The matcher to write when repairing: the expected tools plus any extra the
+/// user had added, so a repair widens rather than truncates.
+fn merged_hook_matcher(actual: Option<&str>, expected: &str) -> String {
+    let mut tools: Vec<&str> = expected
+        .split('|')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    for tool in actual.unwrap_or("").split('|').map(str::trim) {
+        if !tool.is_empty() && !tools.contains(&tool) {
+            tools.push(tool);
+        }
+    }
+    tools.join("|")
 }
 
 /// Find the matcher string currently installed on a tokensave hook entry.
@@ -929,10 +971,13 @@ fn doctor_check_single_hook(dc: &mut DoctorCounters, settings: &serde_json::Valu
 
     if let Some(expected_matcher) = expected_hook_matcher(event) {
         let actual = find_tokensave_hook_matcher(settings, event);
-        if actual.as_deref() != Some(expected_matcher) {
+        if !actual
+            .as_deref()
+            .is_some_and(|m| matcher_covers_expected(m, expected_matcher))
+        {
             dc.fail(&format!(
                 "{event} hook has stale matcher: {:?} (expected \"{expected_matcher}\") — \
-                 will be auto-repaired so the redirect catches Grep and Bash too",
+                 will be auto-repaired so the redirect catches every tool it covers",
                 actual.unwrap_or_default()
             ));
             return;
@@ -971,8 +1016,12 @@ fn doctor_fix_hooks(dc: &mut DoctorCounters, settings_path: &Path, settings: &se
         let expected_matcher = expected_hook_matcher(event);
 
         let current = find_tokensave_hook(&settings, event);
-        let matcher_ok = expected_matcher
-            .is_none_or(|m| find_tokensave_hook_matcher(&settings, event).as_deref() == Some(m));
+        let installed_matcher = find_tokensave_hook_matcher(&settings, event);
+        let matcher_ok = expected_matcher.is_none_or(|m| {
+            installed_matcher
+                .as_deref()
+                .is_some_and(|actual| matcher_covers_expected(actual, m))
+        });
         let correct = current
             .as_ref()
             .is_some_and(|(_, s, legacy)| !*legacy && s == expected_sub)
@@ -994,12 +1043,14 @@ fn doctor_fix_hooks(dc: &mut DoctorCounters, settings_path: &Path, settings: &se
         if current.is_some() {
             uninstall_single_hook(&mut settings, event);
         }
+        let repaired_matcher =
+            expected_matcher.map(|m| merged_hook_matcher(installed_matcher.as_deref(), m));
         install_single_hook(
             &mut settings,
             event,
             &bin,
             expected_sub,
-            expected_matcher,
+            repaired_matcher.as_deref(),
             true,
         );
         repaired = true;
@@ -1063,18 +1114,7 @@ fn doctor_check_permissions(dc: &mut DoctorCounters, settings: &serde_json::Valu
 /// `~/.claude/rules/tokensave.md`, not appended to the user's CLAUDE.md).
 fn doctor_check_claude_md(dc: &mut DoctorCounters, home: &Path) {
     let rules_path = claude_rules_path(&claude_config_dir(home));
-    if rules_path.exists() {
-        let has_rules = std::fs::read_to_string(&rules_path)
-            .unwrap_or_default()
-            .contains("tokensave");
-        if has_rules {
-            dc.pass("rules/tokensave.md contains tokensave rules");
-        } else {
-            dc.fail("rules/tokensave.md missing tokensave rules — run `tokensave install`");
-        }
-    } else {
-        dc.fail("~/.claude/rules/tokensave.md does not exist — run `tokensave install`");
-    }
+    check_managed_rules_file(dc, &rules_path, "claude");
 }
 
 /// Clean up local project config (.mcp.json and settings.local.json).
@@ -1358,7 +1398,7 @@ mod tests {
         json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Agent|Grep|Bash",
+                    "matcher": "Agent|Grep|Bash|Glob",
                     "hooks": [{ "type": "command", "command": bin, "args": ["hook-pre-tool-use"] }]
                 }],
                 "UserPromptSubmit": [{
@@ -1898,7 +1938,7 @@ mod tests {
         let settings = json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Agent|Grep|Bash",
+                    "matcher": "Agent|Grep|Bash|Glob",
                     "hooks": [{
                         "type": "command",
                         "command": "/usr/bin/tokensave",
@@ -1961,6 +2001,151 @@ mod tests {
         );
     }
 
+    /// #389: v7.9.0 shipped #294's `Glob` branch in `hook-pre-tool-use`, but
+    /// the installed matcher was `Agent|Grep|Bash`, so Claude Code never
+    /// routed a `Glob` call to the hook and the branch was unreachable. The
+    /// handler being correct is not enough — the matcher is what decides
+    /// whether the hook is invoked at all, and `doctor` reported the hook as
+    /// installed because the entry, binary, and subcommand were all fine.
+    ///
+    /// Pinned as its own test rather than left to the fixtures above: those
+    /// assert on the whole string and would keep passing if `Glob` were
+    /// swapped for some other tool during a future edit.
+    #[test]
+    fn pretooluse_matcher_covers_glob_so_the_path_redirect_is_reachable() {
+        let Some(matcher) = expected_hook_matcher("PreToolUse") else {
+            panic!("PreToolUse must have a matcher");
+        };
+        let tools: Vec<&str> = matcher.split('|').collect();
+        for required in ["Agent", "Grep", "Bash", "Glob"] {
+            assert!(
+                tools.contains(&required),
+                "PreToolUse matcher must cover {required}, got {matcher:?}"
+            );
+        }
+    }
+
+    /// An install predating #389 carries the narrower matcher. It must be
+    /// repaired rather than accepted, otherwise the fix reaches only people
+    /// who install tokensave for the first time after this change.
+    /// A user who widens the matcher — adding a tool they want the nudge to
+    /// see — kept losing the edit on the next `install`/`doctor --fix`, which
+    /// replaced the matcher outright (#452). A superset covers everything the
+    /// handler routes, so it is not drift.
+    #[test]
+    fn a_user_widened_matcher_survives_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let settings = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Agent|Grep|Bash|Glob|Read",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/bin/tokensave",
+                        "args": ["hook-pre-tool-use"],
+                    }]
+                }],
+                "UserPromptSubmit": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/bin/tokensave",
+                        "args": ["hook-prompt-submit"],
+                    }]
+                }],
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/bin/tokensave",
+                        "args": ["hook-stop"],
+                    }]
+                }]
+            }
+        });
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let mut dc = DoctorCounters::new();
+        doctor_fix_hooks(&mut dc, &settings_path, &settings);
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            after["hooks"]["PreToolUse"][0]["matcher"].as_str(),
+            Some("Agent|Grep|Bash|Glob|Read"),
+            "a matcher covering every routed tool must be left exactly as the user wrote it"
+        );
+    }
+
+    /// Repairing a narrow matcher widens it to what tokensave needs *and*
+    /// keeps whatever else the user had put there.
+    #[test]
+    fn repairing_a_narrow_matcher_keeps_user_additions() {
+        assert_eq!(
+            merged_hook_matcher(Some("Agent|Grep|Read"), "Agent|Grep|Bash|Glob"),
+            "Agent|Grep|Bash|Glob|Read"
+        );
+        assert!(matcher_covers_expected(
+            "Read|Glob|Bash|Grep|Agent",
+            "Agent|Grep|Bash|Glob"
+        ));
+        assert!(!matcher_covers_expected(
+            "Agent|Grep|Bash",
+            "Agent|Grep|Bash|Glob"
+        ));
+    }
+
+    #[test]
+    fn doctor_fix_upgrades_a_pre_glob_matcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let settings = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Agent|Grep|Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/bin/tokensave",
+                        "args": ["hook-pre-tool-use"],
+                    }]
+                }],
+                "UserPromptSubmit": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/bin/tokensave",
+                        "args": ["hook-prompt-submit"],
+                    }]
+                }],
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/bin/tokensave",
+                        "args": ["hook-stop"],
+                    }]
+                }]
+            }
+        });
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let mut dc = DoctorCounters::new();
+        doctor_fix_hooks(&mut dc, &settings_path, &settings);
+
+        let fixed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            fixed["hooks"]["PreToolUse"][0]["matcher"].as_str(),
+            expected_hook_matcher("PreToolUse"),
+            "a pre-#389 matcher must be widened to include Glob"
+        );
+    }
+
     #[test]
     fn doctor_fix_upgrades_stale_pretool_matcher() {
         let dir = tempfile::tempdir().unwrap();
@@ -2005,8 +2190,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(
             fixed["hooks"]["PreToolUse"][0]["matcher"].as_str(),
-            Some("Agent|Grep|Bash"),
-            "stale Agent-only matcher must be upgraded to Agent|Grep|Bash"
+            Some("Agent|Grep|Bash|Glob"),
+            "stale Agent-only matcher must be upgraded to the full tool set"
         );
         // Bin path preserved across the matcher repair.
         assert_eq!(

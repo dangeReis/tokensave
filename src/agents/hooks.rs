@@ -7,10 +7,11 @@ use crate::agents::home_dir;
 use clap::ValueEnum;
 use std::path::{Path, PathBuf};
 
-/// Whether `tokensave install` should install the global git `post-commit`
-/// hook, and if so, whether to ask the user interactively or act
-/// non-interactively. The `Default` variant preserves the previous
-/// behavior: prompt on a TTY, silently skip on a non-TTY.
+/// Whether `tokensave install` should install the global git
+/// `post-commit`/`post-checkout`/`post-merge` hooks, and if so, whether to
+/// ask the user interactively or act non-interactively. The `Default`
+/// variant preserves the previous behavior: prompt on a TTY, silently skip
+/// on a non-TTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum GitHookMode {
     /// Preserve today's behavior — prompt on a TTY, silently skip otherwise.
@@ -26,6 +27,25 @@ const HOOK_MARKER: &str = "# tokensave: auto-sync";
 
 /// Marker comment identifying tokensave's section in the post-checkout hook.
 const HOOK_MARKER_CHECKOUT: &str = "# tokensave: auto-init";
+
+/// Marker comment identifying tokensave's section in the post-merge hook.
+///
+/// `git pull` on a fast-forward or non-rebase merge fires `post-merge`, not
+/// `post-commit` or `post-checkout` — so without this hook, pulling a
+/// teammate's changes left the index stale until the next local commit
+/// (`post-commit`) or branch switch (`post-checkout`). The section shares
+/// [`post_commit_snippet`]'s body (an unconditional background `sync`),
+/// since `post-merge`'s arguments (`$1` squash flag) don't change what
+/// tokensave needs to do.
+const HOOK_MARKER_MERGE: &str = "# tokensave: auto-sync (post-merge)";
+
+/// Marker comment closing tokensave's section in the post-checkout hook.
+///
+/// Written since #391 so that a migration can replace the section body in
+/// place instead of having to pattern-match the shapes that shipped in 6.4.3
+/// and 7.3.0 (both of which end in a bare `fi`). Whether such a migration runs
+/// automatically or only on prompt is the open policy question in #342 Q1.
+const HOOK_MARKER_CHECKOUT_END: &str = "# tokensave: end auto-init";
 
 /// Marker comment identifying the repo-hook chaining preamble (issue #164).
 const HOOK_MARKER_CHAIN: &str = "# tokensave: chain-repo-hook";
@@ -54,16 +74,18 @@ fn chain_repo_hook_snippet(hook_name: &str) -> String {
 ///
 /// A global `core.hooksPath` makes git resolve **every** hook type from that one
 /// directory, with no fallback to `.git/hooks/`. The #164 fix only re-chained
-/// the two hooks tokensave owns (`post-commit`, `post-checkout`), so a repo's
-/// own `pre-commit`, `pre-push`, `commit-msg`, … (as delivered by
-/// `init.templateDir`, husky, pre-commit, lefthook, …) still stopped running.
-/// tokensave drops a pure forwarder for each of these so they keep firing.
+/// the three hooks tokensave owns (`post-commit`, `post-checkout`,
+/// `post-merge`), so a repo's own `pre-commit`, `pre-push`, `commit-msg`, …
+/// (as delivered by `init.templateDir`, husky, pre-commit, lefthook, …) still
+/// stopped running. tokensave drops a pure forwarder for each of these so
+/// they keep firing.
 ///
-/// `post-commit`/`post-checkout` are intentionally excluded — they are written
-/// separately with the chaining preamble **plus** tokensave's own action. The
-/// list is the client-side set from `githooks(5)`; server-side hooks
-/// (`pre-receive`, `update`, `post-receive`, `post-update`, `proc-receive`) and
-/// the config-driven `fsmonitor-watchman` are omitted.
+/// `post-commit`/`post-checkout`/`post-merge` are intentionally excluded —
+/// they are written separately with the chaining preamble **plus**
+/// tokensave's own action. The list is the client-side set from
+/// `githooks(5)`; server-side hooks (`pre-receive`, `update`,
+/// `post-receive`, `post-update`, `proc-receive`) and the config-driven
+/// `fsmonitor-watchman` are omitted.
 const FORWARDED_REPO_HOOKS: &[&str] = &[
     "applypatch-msg",
     "pre-applypatch",
@@ -73,7 +95,6 @@ const FORWARDED_REPO_HOOKS: &[&str] = &[
     "prepare-commit-msg",
     "commit-msg",
     "pre-rebase",
-    "post-merge",
     "pre-push",
     "post-rewrite",
     "pre-auto-gc",
@@ -140,23 +161,54 @@ fn post_commit_snippet(tokensave_bin: &str) -> String {
     )
 }
 
+/// The hook snippet appended to (or written as) the post-merge script.
+fn post_merge_snippet(tokensave_bin: &str) -> String {
+    let bin = tokensave_bin.replace('\\', "/");
+    format!(
+        "{HOOK_MARKER_MERGE}\n\
+         {bin} sync >/dev/null 2>&1 &\n"
+    )
+}
+
 /// The hook snippet appended to (or written as) the post-checkout script.
 ///
-/// Runs `tokensave init` in the background on the initial checkout of a fresh
-/// clone — git passes the all-zeros sentinel as the previous HEAD in that case.
-/// On an ordinary **branch** checkout (git passes flag `$3 == 1`) it runs
-/// `tokensave branch add` to transparently track the just-checked-out branch;
-/// that is a no-op when the branch is already tracked or is the default branch.
-/// File checkouts (`$3 == 0`) trigger nothing.
+/// git reports the initial checkout of a fresh clone — and of every new
+/// `git worktree add` — by passing the all-zeros sentinel as the previous
+/// HEAD. That checkout is **also** a branch checkout (git passes flag
+/// `$3 == 1`) and it can land on a branch that is not the default one:
+/// `git worktree add -b feature` and `git clone -b feature` both do. So the
+/// sentinel arm runs `tokensave init` **and then**
+/// `tokensave branch add --if-enabled`:
+/// sequentially, because `branch add` copies the index that `init` creates,
+/// and inside a single background job, because two independent background
+/// jobs would race (#391).
+///
+/// Any other branch checkout (`$3 == 1` with a real previous HEAD) runs
+/// `tokensave branch add --if-enabled` alone to transparently track the
+/// just-checked-out branch; that is a no-op when the branch is already
+/// tracked, is the default branch, or when `auto_track` is off (#397 — the
+/// flag is what makes that knob authoritative on the hook path rather than
+/// only inside `TokenSave::open`). File checkouts (`$3 == 0`) trigger nothing.
+///
+/// The section is fenced by [`HOOK_MARKER_CHECKOUT`] and
+/// [`HOOK_MARKER_CHECKOUT_END`]. Changing this body does not reach an install
+/// that already has the hook: the installer skips a post-checkout file that
+/// already carries the marker, and [`write_global_hook`] never replaces
+/// existing content. Migrating those installs is the open policy question in
+/// #342 Q1.
 fn post_checkout_snippet(tokensave_bin: &str) -> String {
     let bin = tokensave_bin.replace('\\', "/");
     format!(
         "{HOOK_MARKER_CHECKOUT}\n\
          if [ \"$1\" = \"0000000000000000000000000000000000000000\" ]; then\n\
-         \t{bin} init >/dev/null 2>&1 &\n\
+         \t(\n\
+         \t\t{bin} init >/dev/null 2>&1 || exit 0\n\
+         \t\t{bin} branch add --if-enabled >/dev/null 2>&1\n\
+         \t) &\n\
          elif [ \"$3\" = \"1\" ]; then\n\
-         \t{bin} branch add >/dev/null 2>&1 &\n\
-         fi\n"
+         \t{bin} branch add --if-enabled >/dev/null 2>&1 &\n\
+         fi\n\
+         {HOOK_MARKER_CHECKOUT_END}\n"
     )
 }
 
@@ -300,7 +352,7 @@ pub fn offer_git_post_commit_hook(tokensave_bin: &str, mode: GitHookMode) {
             // TTY + default mode: ask, and bail entirely if the user declines.
             eprintln!();
             eprint!(
-                "Install global git \x1b[1mpost-commit\x1b[0m + \x1b[1mpost-checkout\x1b[0m hooks to auto-run \x1b[1mtokensave sync\x1b[0m after each commit and \x1b[1mtokensave init\x1b[0m after a fresh clone? [y/N] "
+                "Install global git \x1b[1mpost-commit\x1b[0m + \x1b[1mpost-checkout\x1b[0m + \x1b[1mpost-merge\x1b[0m hooks to auto-run \x1b[1mtokensave sync\x1b[0m after each commit and \x1b[1mgit pull\x1b[0m, and \x1b[1mtokensave init\x1b[0m after a fresh clone? [y/N] "
             );
             let mut answer = String::new();
             if std::io::stdin().read_line(&mut answer).is_err() {
@@ -355,9 +407,11 @@ pub fn offer_git_post_commit_hook(tokensave_bin: &str, mode: GitHookMode) {
         );
     }
 
-    // Install the post-checkout hook so a fresh clone auto-initializes. Its
-    // marker is independent of post-commit's, so this is skipped only when the
-    // post-checkout hook itself is already present.
+    // Install the post-checkout hook so a fresh clone or worktree
+    // auto-initializes and tracks its branch. Its marker is independent of
+    // post-commit's, so this is skipped only when the post-checkout hook
+    // itself is already present — which also means a body change here never
+    // reaches an existing install (#342 Q1).
     let checkout_path = hooks_dir.join("post-checkout");
     let checkout_contents = std::fs::read_to_string(&checkout_path).ok();
     if should_chain_repo_hooks(
@@ -376,11 +430,323 @@ pub fn offer_git_post_commit_hook(tokensave_bin: &str, mode: GitHookMode) {
         );
     }
 
+    // Install the post-merge hook so `git pull` (fast-forward or a real
+    // merge) reindexes teammates' changes instead of waiting for the next
+    // local commit or branch switch. Same independent-marker treatment as
+    // post-checkout above.
+    let merge_path = hooks_dir.join("post-merge");
+    let merge_contents = std::fs::read_to_string(&merge_path).ok();
+    if should_chain_repo_hooks(
+        need_set_hookspath,
+        hooks_dir_is_default,
+        merge_contents.as_deref(),
+    ) {
+        write_global_hook(&merge_path, &chain_repo_hook_snippet("post-merge"));
+    }
+    let merge_present = merge_contents.is_some_and(|c| c.contains(HOOK_MARKER_MERGE));
+    if !merge_present && write_global_hook(&merge_path, &post_merge_snippet(tokensave_bin)) {
+        eprintln!(
+            "\x1b[32m✔\x1b[0m Installed global git post-merge hook at {}",
+            merge_path.display()
+        );
+    }
+
     // Issue #164 follow-up: claiming a global core.hooksPath disables *every*
-    // hook type in each repo's .git/hooks/, not just the two tokensave owns.
+    // hook type in each repo's .git/hooks/, not just the three tokensave owns.
     // Drop pure forwarders for the remaining client-side hooks so a repo's own
     // pre-commit / pre-push / commit-msg / … keep running.
     install_repo_hook_forwarders(&hooks_dir, need_set_hookspath, hooks_dir_is_default);
+}
+
+// ---------------------------------------------------------------------------
+// Removal (#420)
+// ---------------------------------------------------------------------------
+
+/// What [`remove_git_hooks`] did, so the caller can report it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HookRemoval {
+    /// The global hooks directory that was inspected.
+    pub hooks_dir: PathBuf,
+    /// Hook files that had a tokensave section removed but kept other content.
+    pub cleaned: Vec<PathBuf>,
+    /// Hook files deleted because nothing but tokensave's own content was left.
+    pub deleted: Vec<PathBuf>,
+    /// Whether `core.hooksPath` was unset from the global gitconfig.
+    pub hooks_path_unset: bool,
+    /// Set when the hooks directory was left in place because it still holds
+    /// files tokensave did not write.
+    pub dir_kept_for_foreign_files: bool,
+}
+
+impl HookRemoval {
+    /// True when nothing tokensave-owned was found to remove.
+    pub fn found_nothing(&self) -> bool {
+        self.cleaned.is_empty() && self.deleted.is_empty() && !self.hooks_path_unset
+    }
+}
+
+/// True for a line that opens or closes one of tokensave's hook sections.
+fn is_tokensave_marker(line: &str) -> bool {
+    line.trim_start().starts_with("# tokensave:")
+}
+
+/// Remove every tokensave-owned section from a hook script.
+///
+/// A section runs from its `# tokensave:` marker to the first blank line, to
+/// the section's own end marker, or to end of file — whichever comes first.
+/// That rule covers all three shapes that have shipped: `post-commit`, whose
+/// section is a marker plus one command and has never had an end marker; the
+/// fenced `post-checkout` section written since #391; and the unfenced
+/// `post-checkout` bodies from 6.4.3 and 7.3.0, which end in a bare `fi`
+/// followed by a blank line. [`write_global_hook`] separates every appended
+/// snippet with a blank line, so the boundary is reliable.
+///
+/// Returns `None` when the script holds no tokensave section, so a hook file
+/// the user wrote themselves is never rewritten.
+pub(crate) fn strip_tokensave_sections(contents: &str) -> Option<String> {
+    if !contents.contains("# tokensave:") {
+        return None;
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut lines = contents.lines().peekable();
+    while let Some(line) = lines.next() {
+        if !is_tokensave_marker(line) {
+            out.push(line);
+            continue;
+        }
+        // Consume the section body. An end marker is consumed with it; a blank
+        // line is the boundary and is left for the blank-run collapse below.
+        let fenced = line.trim() == HOOK_MARKER_CHECKOUT;
+        while let Some(next) = lines.peek() {
+            if next.trim().is_empty() {
+                break;
+            }
+            let is_end = fenced && next.trim() == HOOK_MARKER_CHECKOUT_END;
+            let stop_before = !is_end && is_tokensave_marker(next);
+            if stop_before {
+                break;
+            }
+            lines.next();
+            if is_end {
+                break;
+            }
+        }
+    }
+    // Collapse the blank runs the removals left behind.
+    let mut cleaned: Vec<&str> = Vec::new();
+    for line in out {
+        if line.trim().is_empty() && cleaned.last().is_none_or(|p| p.trim().is_empty()) {
+            continue;
+        }
+        cleaned.push(line);
+    }
+    while cleaned.last().is_some_and(|l| l.trim().is_empty()) {
+        cleaned.pop();
+    }
+    if cleaned.is_empty() {
+        return Some(String::new());
+    }
+    Some(format!("{}\n", cleaned.join("\n")))
+}
+
+/// True when what is left of a hook script would do nothing — empty, or a
+/// shebang and whitespace only. Such a file is tokensave's to delete; anything
+/// else is the user's and is kept with the tokensave section stripped out.
+fn is_inert_hook(contents: &str) -> bool {
+    contents
+        .lines()
+        .all(|l| l.trim().is_empty() || l.trim_start().starts_with("#!"))
+}
+
+/// Describe the global git hooks tokensave currently owns, one line per
+/// finding, for `tokensave githooks` with no action.
+///
+/// A read-only query: it opens the hooks directory and the gitconfig and
+/// writes neither (#419).
+pub fn describe_git_hooks() -> Vec<String> {
+    let Some(home) = home_dir() else {
+        return vec!["could not determine home directory".to_string()];
+    };
+    let default_hooks_dir = home.join(".config").join("git").join("hooks");
+    let configured = read_global_hooks_path(&home);
+    let hooks_dir = configured
+        .clone()
+        .unwrap_or_else(|| default_hooks_dir.clone());
+
+    let mut out = vec![match &configured {
+        Some(d) => format!("core.hooksPath: {}", d.display()),
+        None => "core.hooksPath: not set".to_string(),
+    }];
+
+    let owned = ["post-commit", "post-checkout", "post-merge"];
+    let mut acting: Vec<&str> = Vec::new();
+    let mut forwarders = 0usize;
+    for name in owned.iter().copied().chain(
+        FORWARDED_REPO_HOOKS
+            .iter()
+            .copied()
+            .filter(|n| !owned.contains(n)),
+    ) {
+        let Ok(contents) = std::fs::read_to_string(hooks_dir.join(name)) else {
+            continue;
+        };
+        if contents.contains(HOOK_MARKER)
+            || contents.contains(HOOK_MARKER_CHECKOUT)
+            || contents.contains(HOOK_MARKER_MERGE)
+        {
+            acting.push(name);
+        } else if contents.contains(HOOK_MARKER_CHAIN) {
+            forwarders += 1;
+        }
+    }
+
+    if acting.is_empty() && forwarders == 0 {
+        out.push(format!(
+            "no tokensave git hooks installed in {}",
+            hooks_dir.display()
+        ));
+        out.push("install them with `tokensave githooks on`".to_string());
+        return out;
+    }
+    for name in &acting {
+        out.push(format!("{name}: runs tokensave"));
+    }
+    if forwarders > 0 {
+        out.push(format!(
+            "{forwarders} forwarder(s) to each repository's own hooks"
+        ));
+    }
+    out.push("remove them with `tokensave githooks off`".to_string());
+    out
+}
+
+/// Remove tokensave's global git hooks: the `post-commit`, `post-checkout`,
+/// and `post-merge` sections, the pure forwarders installed for every other client-side hook
+/// (#164 follow-up), and `core.hooksPath` when tokensave's own default
+/// directory is left empty.
+///
+/// The inverse of [`offer_git_post_commit_hook`], and the missing half of
+/// `tokensave uninstall` (#420): before this, uninstalling from every agent
+/// and deleting a project's index still left a global `post-commit` hook that
+/// recreated the index on the next commit.
+///
+/// Conservative by construction. A hook file that holds anything tokensave did
+/// not write keeps that content and loses only the marked section. A
+/// `core.hooksPath` pointing anywhere other than tokensave's default is left
+/// alone entirely — the user chose it — as is the default directory itself
+/// while it still holds files tokensave did not write.
+pub fn remove_git_hooks() -> HookRemoval {
+    let Some(home) = home_dir() else {
+        return HookRemoval::default();
+    };
+    let default_hooks_dir = home.join(".config").join("git").join("hooks");
+    let hooks_dir = read_global_hooks_path(&home).unwrap_or_else(|| default_hooks_dir.clone());
+    let mut result = HookRemoval {
+        hooks_dir: hooks_dir.clone(),
+        ..Default::default()
+    };
+    if !hooks_dir.exists() {
+        return result;
+    }
+
+    // post-commit, post-checkout, and post-merge carry tokensave's own
+    // actions; the rest of FORWARDED_REPO_HOOKS are pure forwarders. All are
+    // handled by the same strip-then-delete-if-inert rule.
+    let owned = ["post-commit", "post-checkout", "post-merge"];
+    for name in owned.iter().copied().chain(
+        FORWARDED_REPO_HOOKS
+            .iter()
+            .copied()
+            .filter(|n| !owned.contains(n)),
+    ) {
+        let path = hooks_dir.join(name);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(stripped) = strip_tokensave_sections(&contents) else {
+            continue;
+        };
+        if is_inert_hook(&stripped) {
+            if std::fs::remove_file(&path).is_ok() {
+                result.deleted.push(path);
+            }
+        } else if std::fs::write(&path, &stripped).is_ok() {
+            result.cleaned.push(path);
+        }
+    }
+
+    // Only tokensave's own default directory is a candidate for teardown; a
+    // path the user configured stays, and so does core.hooksPath pointing at it.
+    if hooks_dir != default_hooks_dir {
+        return result;
+    }
+    // And only when this run actually removed a tokensave hook. A user who set
+    // core.hooksPath to this same default path themselves, with no tokensave
+    // hooks in it, must not have their config edited by a command that found
+    // nothing of ours to remove — the path alone cannot tell us who wrote it.
+    // The cost is that an already-empty leftover directory is left behind; that
+    // is inert, since git simply finds no hooks there.
+    if result.cleaned.is_empty() && result.deleted.is_empty() {
+        return result;
+    }
+    let empty = std::fs::read_dir(&hooks_dir).is_ok_and(|mut d| d.next().is_none());
+    if !empty {
+        result.dir_kept_for_foreign_files = true;
+        return result;
+    }
+    let _ = std::fs::remove_dir(&hooks_dir);
+    if unset_global_hooks_path(&home.join(".gitconfig"), &hooks_dir) {
+        result.hooks_path_unset = true;
+    }
+    result
+}
+
+/// Remove a `hooksPath = <dir>` entry from the `[core]` section of a gitconfig,
+/// and the now-empty `[core]` header with it. Returns true when the file
+/// changed.
+///
+/// Only removes an entry pointing at `expected_dir`, so a value the user
+/// repointed elsewhere between install and uninstall is left alone.
+fn unset_global_hooks_path(gitconfig_path: &Path, expected_dir: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(gitconfig_path) else {
+        return false;
+    };
+    let expected = expected_dir.to_string_lossy().replace('\\', "/");
+    let mut out: Vec<&str> = Vec::new();
+    let mut removed = false;
+    for line in contents.lines() {
+        let t = line.trim();
+        if let Some((key, value)) = t.split_once('=') {
+            if key.trim().eq_ignore_ascii_case("hookspath")
+                && value.trim().replace('\\', "/") == expected
+            {
+                removed = true;
+                continue;
+            }
+        }
+        out.push(line);
+    }
+    if !removed {
+        return false;
+    }
+    // Drop a `[core]` header the removal just emptied.
+    let mut pruned: Vec<&str> = Vec::new();
+    for (i, line) in out.iter().enumerate() {
+        if line.trim().eq_ignore_ascii_case("[core]") {
+            let next_meaningful = out[i + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'));
+            if next_meaningful.is_none_or(|l| l.trim_start().starts_with('[')) {
+                continue;
+            }
+        }
+        pruned.push(line);
+    }
+    let mut text = pruned.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    std::fs::write(gitconfig_path, text).is_ok()
 }
 
 /// Reads `core.hooksPath` from the global gitconfig files.
@@ -698,6 +1064,19 @@ mod git_hook_tests {
     }
 
     #[test]
+    fn post_merge_snippet_runs_sync_unconditionally() {
+        let s = post_merge_snippet("/usr/local/bin/tokensave");
+        assert!(
+            s.contains(HOOK_MARKER_MERGE),
+            "must carry its idempotency marker, got: {s}"
+        );
+        assert!(
+            s.contains("/usr/local/bin/tokensave sync"),
+            "must run `sync` with the resolved binary so a `git pull` reindexes teammates' changes, got: {s}"
+        );
+    }
+
+    #[test]
     fn post_checkout_snippet_inits_only_on_fresh_clone() {
         let s = post_checkout_snippet("/usr/local/bin/tokensave");
         assert!(
@@ -714,8 +1093,94 @@ mod git_hook_tests {
         );
         assert!(
             s.contains("elif [ \"$3\" = \"1\" ]")
-                && s.contains("/usr/local/bin/tokensave branch add"),
+                && s.contains("/usr/local/bin/tokensave branch add --if-enabled"),
             "must transparently track the branch on a branch checkout (flag $3==1), got: {s}"
+        );
+        assert!(
+            s.trim_end().ends_with(HOOK_MARKER_CHECKOUT_END),
+            "the section must be fenced so a migration can replace it in place, got: {s}"
+        );
+    }
+
+    /// Runs the generated post-checkout snippet under `sh`, with a stub script
+    /// standing in for the tokensave binary, and returns the commands it
+    /// invoked in the order it invoked them.
+    ///
+    /// The snippet backgrounds its work — git does not wait for it — so the
+    /// wrapper appends `wait` to make the observation deterministic.
+    #[cfg(unix)]
+    fn run_post_checkout_snippet(dir: &Path, args: &[&str]) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let log = dir.join("calls.log");
+        let stub = dir.join("tokensave-stub");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\necho \"$*\" >> \"{}\"\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook = dir.join("post-checkout");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n{}\nwait\n",
+                post_checkout_snippet(stub.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+
+        // `sh` is required for this test; a missing shell is a broken
+        // environment, not a skippable condition.
+        let status = std::process::Command::new("sh")
+            .arg(&hook)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "hook script failed: {status}");
+
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(std::string::ToString::to_string)
+            .collect()
+    }
+
+    /// The regression test for #391, and the reason it is written by executing
+    /// the snippet rather than by matching substrings: the bug was that two
+    /// correct-looking commands sat in mutually exclusive arms, which every
+    /// `contains` assertion in the test above passes straight over.
+    #[cfg(unix)]
+    #[test]
+    fn post_checkout_snippet_tracks_the_branch_of_a_fresh_worktree_or_clone() {
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+        const SHA: &str = "1111111111111111111111111111111111111111";
+
+        // A new worktree or a fresh clone: git passes the all-zeros previous
+        // HEAD *and* flag 1, and the branch checked out need not be the
+        // default one (`git worktree add -b`, `git clone -b`). Both commands
+        // must run, `init` first, so `branch add` has an index to copy.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            run_post_checkout_snippet(dir.path(), &[ZERO, SHA, "1"]),
+            vec!["init".to_string(), "branch add --if-enabled".to_string()],
+            "a fresh worktree/clone must be indexed AND have its branch tracked"
+        );
+
+        // An ordinary branch switch tracks the branch without re-indexing.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            run_post_checkout_snippet(dir.path(), &[SHA, SHA, "1"]),
+            vec!["branch add --if-enabled".to_string()],
+            "a branch switch must not re-run init"
+        );
+
+        // A file checkout triggers nothing at all.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            run_post_checkout_snippet(dir.path(), &[SHA, SHA, "0"]).is_empty(),
+            "a file checkout must not run tokensave"
         );
     }
 
@@ -805,11 +1270,12 @@ mod git_hook_tests {
 
     #[test]
     fn forwarded_hooks_cover_common_types_but_not_tokensave_owned() {
-        // The two hooks tokensave installs itself carry the chain preamble
+        // The three hooks tokensave installs itself carry the chain preamble
         // plus tokensave's action, so they must NOT be in the pure-forwarder
         // list (that would double-write / conflict).
         assert!(!FORWARDED_REPO_HOOKS.contains(&"post-commit"));
         assert!(!FORWARDED_REPO_HOOKS.contains(&"post-checkout"));
+        assert!(!FORWARDED_REPO_HOOKS.contains(&"post-merge"));
         // The high-value client-side hooks must be forwarded — these are where
         // husky / pre-commit / lefthook live.
         for h in ["pre-commit", "pre-push", "commit-msg", "prepare-commit-msg"] {
@@ -981,5 +1447,159 @@ mod git_hook_tests {
             }
         }
         None
+    }
+
+    // -----------------------------------------------------------------------
+    // #420: removal
+    // -----------------------------------------------------------------------
+
+    /// A post-commit hook as the installer writes it: shebang, chaining
+    /// preamble, then tokensave's own section.
+    fn installed_post_commit() -> String {
+        format!(
+            "#!/bin/sh\n{}\n{}",
+            chain_repo_hook_snippet("post-commit"),
+            post_commit_snippet("tokensave")
+        )
+    }
+
+    #[test]
+    fn strip_removes_every_tokensave_section_from_a_pure_tokensave_hook() {
+        let stripped = strip_tokensave_sections(&installed_post_commit()).unwrap();
+        assert!(
+            is_inert_hook(&stripped),
+            "nothing but a shebang should remain, got: {stripped:?}"
+        );
+        assert!(!stripped.contains("tokensave"));
+    }
+
+    #[test]
+    fn strip_removes_the_post_merge_section_from_a_pure_tokensave_hook() {
+        let installed = format!(
+            "#!/bin/sh\n{}\n{}",
+            chain_repo_hook_snippet("post-merge"),
+            post_merge_snippet("tokensave")
+        );
+        let stripped = strip_tokensave_sections(&installed).unwrap();
+        assert!(
+            is_inert_hook(&stripped),
+            "nothing but a shebang should remain, got: {stripped:?}"
+        );
+        assert!(!stripped.contains("tokensave"));
+    }
+
+    #[test]
+    fn strip_keeps_a_users_own_hook_content() {
+        let mixed = format!(
+            "#!/bin/sh\necho \"my guard\"\nexit 0\n\n{}",
+            chain_repo_hook_snippet("pre-push")
+        );
+        let stripped = strip_tokensave_sections(&mixed).unwrap();
+        assert!(stripped.contains("echo \"my guard\""));
+        assert!(stripped.contains("exit 0"));
+        assert!(!stripped.contains("tokensave"));
+        assert!(
+            !is_inert_hook(&stripped),
+            "a hook with the user's own commands must not be treated as deletable"
+        );
+    }
+
+    #[test]
+    fn strip_leaves_a_hook_with_no_tokensave_section_alone() {
+        let theirs = "#!/bin/sh\nnpx lint-staged\n";
+        assert_eq!(
+            strip_tokensave_sections(theirs),
+            None,
+            "a file we never wrote to must not be rewritten at all"
+        );
+    }
+
+    #[test]
+    fn strip_handles_the_fenced_post_checkout_section() {
+        let installed = format!(
+            "#!/bin/sh\n{}\n{}",
+            chain_repo_hook_snippet("post-checkout"),
+            post_checkout_snippet("tokensave")
+        );
+        // The fenced body contains blank-line-free shell with its own `fi`, so
+        // this is the case the end marker exists for.
+        let stripped = strip_tokensave_sections(&installed).unwrap();
+        assert!(is_inert_hook(&stripped), "got: {stripped:?}");
+        assert!(!stripped.contains("end auto-init"));
+    }
+
+    #[test]
+    fn strip_handles_the_unfenced_post_checkout_bodies_from_6_4_3_and_7_3_0() {
+        // Those shapes end in a bare `fi` with no end marker, so the blank-line
+        // boundary is what terminates the section.
+        let legacy = "#!/bin/sh\n# tokensave: auto-init\nif [ \"$1\" = \"000\" ]; then\n\ttokensave init &\nfi\n\necho \"mine\"\n";
+        let stripped = strip_tokensave_sections(legacy).unwrap();
+        assert!(stripped.contains("echo \"mine\""));
+        assert!(!stripped.contains("tokensave init"));
+    }
+
+    #[test]
+    fn unset_hookspath_removes_only_our_entry_and_the_emptied_core_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("gitconfig");
+        let hooks = Path::new("/home/u/.config/git/hooks");
+        std::fs::write(
+            &cfg,
+            "[core]\n\thooksPath = /home/u/.config/git/hooks\n[user]\n\tname = T\n",
+        )
+        .unwrap();
+        assert!(unset_global_hooks_path(&cfg, hooks));
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(!after.contains("hooksPath"));
+        assert!(
+            !after.contains("[core]"),
+            "emptied [core] should go: {after:?}"
+        );
+        assert!(
+            after.contains("[user]"),
+            "other sections must survive: {after:?}"
+        );
+    }
+
+    #[test]
+    fn unset_hookspath_keeps_a_core_section_that_still_has_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("gitconfig");
+        std::fs::write(
+            &cfg,
+            "[core]\n\thooksPath = /home/u/.config/git/hooks\n\teditor = vim\n",
+        )
+        .unwrap();
+        assert!(unset_global_hooks_path(
+            &cfg,
+            Path::new("/home/u/.config/git/hooks")
+        ));
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(after.contains("[core]"));
+        assert!(after.contains("editor = vim"));
+        assert!(!after.contains("hooksPath"));
+    }
+
+    #[test]
+    fn unset_hookspath_leaves_a_path_the_user_repointed_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("gitconfig");
+        let original = "[core]\n\thooksPath = /somewhere/else\n";
+        std::fs::write(&cfg, original).unwrap();
+        assert!(
+            !unset_global_hooks_path(&cfg, Path::new("/home/u/.config/git/hooks")),
+            "a value pointing somewhere else is not ours to remove"
+        );
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+    }
+
+    #[test]
+    fn hook_removal_reports_nothing_found_when_it_did_nothing() {
+        assert!(HookRemoval::default().found_nothing());
+        let did = HookRemoval {
+            deleted: vec![PathBuf::from("post-commit")],
+            ..Default::default()
+        };
+        assert!(!did.found_nothing());
     }
 }

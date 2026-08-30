@@ -1,9 +1,155 @@
 //! Node CRUD queries.
 use super::*;
+use std::fmt::Write as _;
 
 // ---------------------------------------------------------------------------
 // Node operations
 // ---------------------------------------------------------------------------
+
+/// A predicate for [`Database::get_nodes_filtered`], built by the caller
+/// instead of applied to a materialised `Vec<Node>` in Rust.
+///
+/// Six MCP handlers used to call `get_all_nodes()` and filter the result,
+/// so a single tool call materialised the whole node table to keep a
+/// fraction of it (#410). Each field here is one of the predicates they
+/// applied; an empty filter is exactly `get_all_nodes()`.
+#[derive(Debug, Clone, Default)]
+pub struct NodeFilter {
+    path_prefix: Option<String>,
+    kinds: Option<Vec<&'static str>>,
+    public_only: bool,
+    min_lines: Option<u32>,
+    name_contains: Option<String>,
+}
+
+/// Escapes a string for use inside a `LIKE` pattern.
+///
+/// Without this, a path containing `_` or `%` acts as a wildcard: a filter for
+/// the directory `a_b` would also match `axb`. That is a wrong-results bug
+/// rather than an error, so it fails silently — which is why the escaping is
+/// paired with a test rather than left to review. `\` is the escape character,
+/// declared with `ESCAPE` at each use site.
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+impl NodeFilter {
+    /// An unconstrained filter, equivalent to selecting every node.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restricts to a file path, or to a directory containing it.
+    ///
+    /// Matches the exact path, or the path plus a `/` separator, mirroring the
+    /// rule the handlers each wrote by hand — so `src` never matches `srcfoo`.
+    #[must_use]
+    pub fn path_prefix(mut self, prefix: &str) -> Self {
+        self.path_prefix = Some(prefix.to_string());
+        self
+    }
+
+    /// Restricts to a set of node kinds.
+    #[must_use]
+    pub fn kinds(mut self, kinds: &[NodeKind]) -> Self {
+        self.kinds = Some(kinds.iter().map(NodeKind::as_str).collect());
+        self
+    }
+
+    /// Restricts to publicly visible nodes.
+    #[must_use]
+    pub fn public_only(mut self) -> Self {
+        self.public_only = true;
+        self
+    }
+
+    /// Restricts to nodes spanning at least `lines` lines, inclusive of both
+    /// endpoints — the same arithmetic the redundancy handler used.
+    #[must_use]
+    pub fn min_lines(mut self, lines: u32) -> Self {
+        self.min_lines = Some(lines);
+        self
+    }
+
+    /// Restricts to nodes whose name or qualified name contains `needle`,
+    /// case-insensitively.
+    #[must_use]
+    pub fn name_contains(mut self, needle: &str) -> Self {
+        self.name_contains = Some(needle.to_ascii_lowercase());
+        self
+    }
+
+    /// Renders the `WHERE` clause, or an empty string when unconstrained.
+    ///
+    /// Values are inlined rather than bound because the kind list is variadic
+    /// and libsql's `params!` is fixed-arity; every inlined value therefore
+    /// goes through `push_quoted` or is an integer, and every `LIKE` pattern
+    /// through [`escape_like`] first.
+    fn where_clause(&self) -> String {
+        let mut clauses: Vec<String> = Vec::new();
+
+        if let Some(prefix) = &self.path_prefix {
+            let exact = prefix.trim_end_matches('/');
+            let mut sql = String::from("(file_path = ");
+            push_quoted(&mut sql, exact);
+            sql.push_str(" OR file_path LIKE ");
+            push_quoted(&mut sql, &format!("{}/%", escape_like(exact)));
+            sql.push_str(" ESCAPE '\\')");
+            clauses.push(sql);
+        }
+
+        if let Some(kinds) = &self.kinds {
+            if kinds.is_empty() {
+                // An explicit empty set matches nothing; without this the
+                // `IN ()` below would be a syntax error.
+                return " WHERE 0".to_string();
+            }
+            let mut sql = String::from("kind IN (");
+            for (i, kind) in kinds.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                push_quoted(&mut sql, kind);
+            }
+            sql.push(')');
+            clauses.push(sql);
+        }
+
+        if self.public_only {
+            let mut sql = String::from("visibility = ");
+            push_quoted(&mut sql, Visibility::Pub.as_str());
+            clauses.push(sql);
+        }
+
+        if let Some(lines) = self.min_lines {
+            // `end_line - start_line + 1`, matching the handler. Written with
+            // the subtraction on the right so a node whose end precedes its
+            // start cannot underflow into a huge span the way saturating
+            // integer arithmetic would.
+            clauses.push(format!("(end_line + 1 - start_line) >= {lines}"));
+        }
+
+        if let Some(needle) = &self.name_contains {
+            let pattern = format!("%{}%", escape_like(needle));
+            let mut sql = String::from("(LOWER(name) LIKE ");
+            push_quoted(&mut sql, &pattern);
+            sql.push_str(" ESCAPE '\\' OR LOWER(qualified_name) LIKE ");
+            push_quoted(&mut sql, &pattern);
+            sql.push_str(" ESCAPE '\\')");
+            clauses.push(sql);
+        }
+
+        if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        }
+    }
+}
 
 impl Database {
     /// Inserts or replaces a single node.
@@ -545,6 +691,256 @@ impl Database {
             })?;
 
         collect_rows(&mut rows, row_to_node, "get_all_nodes").await
+    }
+
+    /// Replaces the recorded ambiguities for a set of files (#412).
+    ///
+    /// Scoped by file so an incremental sync refreshes only what it re-resolved
+    /// rather than clearing the whole table, matching how nodes and edges are
+    /// replaced per file.
+    pub async fn replace_ambiguous_calls(
+        &self,
+        files: &[String],
+        calls: &[AmbiguousCall],
+    ) -> Result<()> {
+        for file in files {
+            self.conn()
+                .execute(
+                    "DELETE FROM ambiguous_calls WHERE file_path = ?1",
+                    params![file.as_str()],
+                )
+                .await
+                .map_err(|e| TokenSaveError::Database {
+                    message: format!("failed to clear ambiguous calls: {e}"),
+                    operation: "replace_ambiguous_calls".to_string(),
+                })?;
+        }
+        for call in calls {
+            let encoded = serde_json::to_string(&call.candidate_node_ids).map_err(|e| {
+                TokenSaveError::Database {
+                    message: format!("failed to encode ambiguity candidates: {e}"),
+                    operation: "replace_ambiguous_calls".to_string(),
+                }
+            })?;
+            self.conn()
+                .execute(
+                    "INSERT OR REPLACE INTO ambiguous_calls
+                     (from_node_id, reference_name, file_path, line, candidate_node_ids)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        call.from_node_id.as_str(),
+                        call.reference_name.as_str(),
+                        call.file_path.as_str(),
+                        i64::from(call.line),
+                        encoded.as_str()
+                    ],
+                )
+                .await
+                .map_err(|e| TokenSaveError::Database {
+                    message: format!("failed to record ambiguous call: {e}"),
+                    operation: "replace_ambiguous_calls".to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Recorded ambiguous calls, optionally scoped to a path prefix.
+    ///
+    /// `limit` is a hard cap rather than a page: a large codebase can carry
+    /// thousands of ambiguous sites, and handing all of them back would swamp
+    /// the caller this feature exists to help.
+    pub async fn get_ambiguous_calls(
+        &self,
+        path_prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AmbiguousCall>> {
+        let mut sql = String::from(
+            "SELECT from_node_id, reference_name, file_path, line, candidate_node_ids
+             FROM ambiguous_calls",
+        );
+        if let Some(prefix) = path_prefix {
+            let exact = prefix.trim_end_matches('/');
+            sql.push_str(" WHERE (file_path = ");
+            push_quoted(&mut sql, exact);
+            sql.push_str(" OR file_path LIKE ");
+            push_quoted(
+                &mut sql,
+                &format!(
+                    "{}/%",
+                    exact
+                        .replace('\\', "\\\\")
+                        .replace('%', "\\%")
+                        .replace('_', "\\_")
+                ),
+            );
+            sql.push_str(" ESCAPE '\\')");
+        }
+        let _ = write!(sql, " ORDER BY file_path, line LIMIT {limit}");
+
+        let mut rows = self
+            .conn()
+            .query(&sql, ())
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query ambiguous calls: {e}"),
+                operation: "get_ambiguous_calls".to_string(),
+            })?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read ambiguous call row: {e}"),
+            operation: "get_ambiguous_calls".to_string(),
+        })? {
+            let encoded = get_string_lossy(&row, 4).unwrap_or_default();
+            out.push(AmbiguousCall {
+                from_node_id: get_string_lossy(&row, 0).unwrap_or_default(),
+                reference_name: get_string_lossy(&row, 1).unwrap_or_default(),
+                file_path: get_string_lossy(&row, 2).unwrap_or_default(),
+                line: row.get::<i64>(3).unwrap_or(0) as u32,
+                candidate_node_ids: serde_json::from_str(&encoded).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Node ids named as a candidate by any recorded ambiguity (#412).
+    ///
+    /// `dead_code` uses this: having refused to fabricate an edge for an
+    /// ambiguous call, reporting its candidates as uncalled would trade a
+    /// fabricated edge for a fabricated finding — and a finding reads as more
+    /// actionable than an edge. "Referenced, target unknown" is not "dead".
+    pub async fn ambiguous_candidate_ids(&self) -> Result<HashSet<String>> {
+        let mut rows = self
+            .conn()
+            .query("SELECT candidate_node_ids FROM ambiguous_calls", ())
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query ambiguity candidates: {e}"),
+                operation: "ambiguous_candidate_ids".to_string(),
+            })?;
+        let mut out = HashSet::new();
+        while let Some(row) = rows.next().await.map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read ambiguity candidate row: {e}"),
+            operation: "ambiguous_candidate_ids".to_string(),
+        })? {
+            let encoded = get_string_lossy(&row, 0).unwrap_or_default();
+            let ids: Vec<String> = serde_json::from_str(&encoded).unwrap_or_default();
+            out.extend(ids);
+        }
+        Ok(out)
+    }
+
+    /// Every node's id paired with its file path, without building a `Node`.
+    ///
+    /// `handle_test_risk` needs this mapping for the *whole* graph — it walks
+    /// every edge, and an edge can point anywhere, so a test in `tests/`
+    /// calling a function in `src/` is exactly what it is looking for. The map
+    /// therefore cannot be scoped the way the predicates in
+    /// [`Self::get_nodes_filtered`] can (#411).
+    ///
+    /// What it can avoid is the other twenty-six columns: materialising a
+    /// `Node` per row costs 248 bytes of struct plus its unbounded `signature`
+    /// and `docstring` strings, to keep two short ones. Asserted equal to the
+    /// map built from `get_all_nodes` in `tests/node_filter_test.rs`.
+    pub async fn get_node_paths(&self) -> Result<HashMap<String, String>> {
+        let mut rows = self
+            .conn()
+            .query("SELECT id, file_path FROM nodes", ())
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query node paths: {e}"),
+                operation: "get_node_paths".to_string(),
+            })?;
+
+        let mut map = HashMap::new();
+        while let Some(row) = rows.next().await.map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read node path row: {e}"),
+            operation: "get_node_paths".to_string(),
+        })? {
+            let id = get_string_lossy(&row, 0).map_err(|e| TokenSaveError::Database {
+                message: format!("failed to read node id: {e}"),
+                operation: "get_node_paths".to_string(),
+            })?;
+            let path = get_string_lossy(&row, 1).map_err(|e| TokenSaveError::Database {
+                message: format!("failed to read node file_path: {e}"),
+                operation: "get_node_paths".to_string(),
+            })?;
+            map.insert(id, path);
+        }
+        Ok(map)
+    }
+
+    /// Every node matching `filter`, evaluated in SQL rather than in Rust.
+    ///
+    /// The handlers this replaces each loaded the whole node table and kept a
+    /// fraction of it, so one tool call on a large project re-triggered a
+    /// graph-sized allocation on a *read* (#410). An empty [`NodeFilter`] is
+    /// equivalent to [`Self::get_all_nodes`], so a handler with nothing to
+    /// scope by keeps working.
+    ///
+    /// Behaviour is asserted equal to the in-Rust filters in
+    /// `tests/node_filter_test.rs` — these predicates are user-visible through
+    /// `redundancy`, `module_api`, `unused_imports`, `gini`, `health` and
+    /// `literal_search`, so a subtly different one would silently change what
+    /// those tools report rather than fail.
+    pub async fn get_nodes_filtered(&self, filter: &NodeFilter) -> Result<Vec<Node>> {
+        let sql = format!(
+            "SELECT id, kind, name, qualified_name, file_path,
+                start_line, end_line, start_column, end_column,
+                docstring, signature, visibility, is_async, branches, loops, returns, max_nesting, unsafe_blocks, unchecked_calls, assertions, updated_at, attrs_start_line, parent_id, cognitive_complexity, distinct_operators, distinct_operands, total_operators, total_operands
+             FROM nodes{}",
+            filter.where_clause()
+        );
+        let mut rows = self
+            .conn()
+            .query(&sql, ())
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query filtered nodes: {e}"),
+                operation: "get_nodes_filtered".to_string(),
+            })?;
+
+        collect_rows(&mut rows, row_to_node, "get_nodes_filtered").await
+    }
+
+    /// Every node, without the two columns resolution never reads (#306).
+    ///
+    /// `docstring` and `signature` are unbounded TEXT — an extractor stores a
+    /// `const`'s whole initializer in `signature`, which #362 found reaching
+    /// roughly 43 KB for one node — and they dominate a `Node`'s heap
+    /// footprint. `ReferenceResolver` reads only `id`, `kind`, `name`,
+    /// `qualified_name`, `file_path`, `start_line`, `visibility` and
+    /// `parent_id`, yet the whole `Vec<Node>` stays resident for the entire
+    /// resolution pass, so those two columns were pure peak.
+    ///
+    /// The resolver borrows from that slice for its lifetime and needs a
+    /// global name index to resolve cross-file references, so the pass cannot
+    /// be chunked or streamed without a redesign. Narrowing what each node
+    /// carries is the part that can be done without changing behaviour.
+    ///
+    /// `NULL` placeholders keep the column *positions* identical so
+    /// [`row_to_node`] is shared rather than duplicated; the two fields come
+    /// back as `None`. Use [`Self::get_all_nodes`] anywhere the text is
+    /// actually needed — `tests/resolution_slim_nodes_test.rs` asserts the two
+    /// loads resolve identically, so a future resolver change that starts
+    /// reading either field fails loudly instead of silently seeing `None`.
+    pub async fn get_all_nodes_for_resolution(&self) -> Result<Vec<Node>> {
+        let mut rows = self
+            .conn()
+            .query(
+                "SELECT id, kind, name, qualified_name, file_path,
+                    start_line, end_line, start_column, end_column,
+                    NULL AS docstring, NULL AS signature, visibility, is_async, branches, loops, returns, max_nesting, unsafe_blocks, unchecked_calls, assertions, updated_at, attrs_start_line, parent_id, cognitive_complexity, distinct_operators, distinct_operands, total_operators, total_operands
+                 FROM nodes",
+                (),
+            )
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query all nodes for resolution: {e}"),
+                operation: "get_all_nodes_for_resolution".to_string(),
+            })?;
+
+        collect_rows(&mut rows, row_to_node, "get_all_nodes_for_resolution").await
     }
 
     /// Deletes all nodes (and cascading edges, unresolved refs, vectors) for a file.

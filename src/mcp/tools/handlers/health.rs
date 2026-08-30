@@ -66,23 +66,29 @@ pub(super) async fn compute_health_snapshot(
     let depth_result = dependency_depth(&adj, 1);
     let depth = depth_score(depth_result.max_depth, depth_result.ideal_depth);
 
-    let all_nodes = cg.get_all_nodes().await?;
-    let nodes: Vec<_> = all_nodes
-        .iter()
-        .filter(|n| {
-            path_prefix.is_none_or(|pfx| {
-                let with_slash = if pfx.ends_with('/') {
-                    pfx.to_string()
-                } else {
-                    format!("{pfx}/")
-                };
-                n.file_path.starts_with(&with_slash) || n.file_path == pfx
-            })
-        })
-        .collect();
+    // Scoped in SQL rather than by loading every node and filtering (#410).
+    // Unscoped, this is still the whole table — the snapshot aggregates over
+    // the project by definition — but a `path` request now costs its subset.
+    let mut filter = crate::db::NodeFilter::new();
+    if let Some(prefix) = path_prefix {
+        filter = filter.path_prefix(prefix);
+    }
+    let scoped = cg.db().get_nodes_filtered(&filter).await?;
+    let nodes: Vec<_> = scoped.iter().collect();
 
     let mut per_file_complexity: HashMap<String, f64> = HashMap::new();
     for n in &nodes {
+        // The `file` node spans the whole file and carries no branches, loops
+        // or nesting, so summing it in added each file's length a second time
+        // on top of the spans of the symbols inside it (#422). Every file gets
+        // a zero entry below, so a file with no extracted symbols still ranks
+        // — at 0, which is what "no measured complexity" should look like.
+        if n.kind == NodeKind::File {
+            per_file_complexity
+                .entry(n.file_path.clone())
+                .or_insert(0.0);
+            continue;
+        }
         let c = f64::from(n.branches) * 2.0
             + f64::from(n.loops) * 2.0
             + f64::from(n.max_nesting) * 3.0
@@ -187,6 +193,14 @@ pub(super) async fn compute_health_snapshot(
     })
 }
 
+/// The node kinds `tokensave_gini` measures when `scope` is `symbol`.
+fn is_symbol_kind(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Function | NodeKind::Method | NodeKind::SingletonMethod
+    )
+}
+
 /// Handles `tokensave_gini` tool calls.
 pub(super) async fn handle_gini(
     cg: &TokenSave,
@@ -204,27 +218,47 @@ pub(super) async fn handle_gini(
         .map_or(10, |v| v.min(100) as usize);
     let path_prefix = effective_path(&args, scope_prefix);
 
-    let all_nodes = cg.get_all_nodes().await?;
-    let all_edges = if metric == "fan_in" || metric == "fan_out" {
+    // Path scoping happens in SQL (#410); `all_edges` still spans the graph
+    // because fan-in/fan-out of a scoped node counts edges from outside it.
+    let mut node_filter = crate::db::NodeFilter::new();
+    if let Some(prefix) = path_prefix {
+        node_filter = node_filter.path_prefix(prefix);
+    }
+    let nodes = cg.db().get_nodes_filtered(&node_filter).await?;
+    let fan = metric == "fan_in" || metric == "fan_out";
+    let all_edges = if fan {
         cg.get_all_edges().await?
     } else {
         vec![]
     };
 
-    // Apply path filter
-    let nodes: Vec<_> = all_nodes
-        .into_iter()
-        .filter(|n| {
-            path_prefix.is_none_or(|pfx| {
-                let with_slash = if pfx.ends_with('/') {
-                    pfx.to_string()
-                } else {
-                    format!("{pfx}/")
-                };
-                n.file_path.starts_with(&with_slash) || n.file_path == pfx
-            })
-        })
-        .collect();
+    // The file-scope fan arms map each edge endpoint to its file. That map has
+    // to span the graph: built from the filtered nodes, an edge whose other end
+    // lives outside the prefix resolves to nothing and is dropped, so a scoped
+    // file's fan-in counted only its intra-prefix callers — and the whole-graph
+    // `all_edges` load above it was then wasted (#423, #422). The comment there
+    // states the intent: fan-in of a scoped node counts edges from outside it.
+    //
+    // Only needed when a prefix is set and only for the two fan metrics; the
+    // unfiltered case already has every node in `nodes`.
+    let outside_nodes = if fan && path_prefix.is_some() {
+        cg.db()
+            .get_nodes_filtered(&crate::db::NodeFilter::new())
+            .await?
+    } else {
+        vec![]
+    };
+    let node_to_file: HashMap<&str, &str> = if outside_nodes.is_empty() {
+        nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.file_path.as_str()))
+            .collect()
+    } else {
+        outside_nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.file_path.as_str()))
+            .collect()
+    };
 
     // Build named_values per metric+scope
     let named_values: Vec<(String, f64)> = match (metric, scope) {
@@ -237,49 +271,72 @@ pub(super) async fn handle_gini(
             per_file.into_iter().collect()
         }
         ("lines", "file") => {
-            let mut per_file: HashMap<String, f64> = HashMap::new();
+            // A file's length is the span of its own `file` node, which matches
+            // `wc -l`. Summing every node's span instead counted one physical
+            // line once per enclosing node — struct, impl, method, field, enum
+            // variant — on top of the file node's full span, so `src/types.rs`
+            // reported 2,104 lines against an actual 849, and the inflation
+            // ran from 1.00x to 3.45x across this repository, reordering the
+            // ranking the metric exists to produce (#422).
+            //
+            // The fallback is `max(end_line)` for a file with no `file` node,
+            // which is the best available answer for one; it is not reached by
+            // any language indexed today.
+            let mut own_span: HashMap<&str, f64> = HashMap::new();
+            let mut max_end: HashMap<&str, u32> = HashMap::new();
             for n in &nodes {
-                let lines = f64::from(n.end_line.saturating_sub(n.start_line) + 1);
-                *per_file.entry(n.file_path.clone()).or_insert(0.0) += lines;
+                if n.kind == NodeKind::File {
+                    own_span.insert(
+                        n.file_path.as_str(),
+                        f64::from(n.end_line.saturating_sub(n.start_line) + 1),
+                    );
+                }
+                let seen = max_end.entry(n.file_path.as_str()).or_insert(0);
+                *seen = (*seen).max(n.end_line);
             }
-            per_file.into_iter().collect()
+            max_end
+                .into_iter()
+                .map(|(f, end)| {
+                    let lines = own_span.get(f).copied().unwrap_or_else(|| f64::from(end));
+                    (f.to_string(), lines)
+                })
+                .collect()
         }
         ("fan_in", "file") => {
-            let node_to_file: HashMap<String, String> = nodes
-                .iter()
-                .map(|n| (n.id.clone(), n.file_path.clone()))
-                .collect();
+            // Only files inside the scope are ranked; their callers may be
+            // anywhere, which is what `node_to_file` spanning the graph buys.
             let mut per_file: HashMap<String, f64> = HashMap::new();
-            // Initialize all files
             for n in &nodes {
                 per_file.entry(n.file_path.clone()).or_insert(0.0);
             }
             for e in &all_edges {
-                if let (Some(src_file), Some(tgt_file)) =
-                    (node_to_file.get(&e.source), node_to_file.get(&e.target))
-                {
+                if let (Some(src_file), Some(tgt_file)) = (
+                    node_to_file.get(e.source.as_str()),
+                    node_to_file.get(e.target.as_str()),
+                ) {
                     if src_file != tgt_file {
-                        *per_file.entry(tgt_file.clone()).or_insert(0.0) += 1.0;
+                        if let Some(count) = per_file.get_mut(*tgt_file) {
+                            *count += 1.0;
+                        }
                     }
                 }
             }
             per_file.into_iter().collect()
         }
         ("fan_out", "file") => {
-            let node_to_file: HashMap<String, String> = nodes
-                .iter()
-                .map(|n| (n.id.clone(), n.file_path.clone()))
-                .collect();
             let mut per_file: HashMap<String, f64> = HashMap::new();
             for n in &nodes {
                 per_file.entry(n.file_path.clone()).or_insert(0.0);
             }
             for e in &all_edges {
-                if let (Some(src_file), Some(tgt_file)) =
-                    (node_to_file.get(&e.source), node_to_file.get(&e.target))
-                {
+                if let (Some(src_file), Some(tgt_file)) = (
+                    node_to_file.get(e.source.as_str()),
+                    node_to_file.get(e.target.as_str()),
+                ) {
                     if src_file != tgt_file {
-                        *per_file.entry(src_file.clone()).or_insert(0.0) += 1.0;
+                        if let Some(count) = per_file.get_mut(*src_file) {
+                            *count += 1.0;
+                        }
                     }
                 }
             }
@@ -308,16 +365,50 @@ pub(super) async fn handle_gini(
             }
             per_class.into_values().collect()
         }
-        (_, "symbol") => {
-            // Per-function/method complexity
+        ("lines", "symbol") => nodes
+            .iter()
+            .filter(|n| is_symbol_kind(&n.kind))
+            .map(|n| {
+                let lines = f64::from(n.end_line.saturating_sub(n.start_line) + 1);
+                (format!("{}:{}", n.file_path, n.name), lines)
+            })
+            .collect(),
+        ("fan_in" | "fan_out", "symbol") => {
+            // Mirrors the file-scope arms above: every edge kind counts, and an
+            // edge whose endpoints are the same symbol does not, so a recursive
+            // call is not counted as a dependant of itself.
+            let incoming = metric == "fan_in";
+            let mut per_symbol: HashMap<&str, f64> = nodes
+                .iter()
+                .filter(|n| is_symbol_kind(&n.kind))
+                .map(|n| (n.id.as_str(), 0.0))
+                .collect();
+            for e in &all_edges {
+                if e.source == e.target {
+                    continue;
+                }
+                let endpoint = if incoming { &e.target } else { &e.source };
+                if let Some(count) = per_symbol.get_mut(endpoint.as_str()) {
+                    *count += 1.0;
+                }
+            }
             nodes
                 .iter()
-                .filter(|n| {
-                    matches!(
-                        n.kind,
-                        NodeKind::Function | NodeKind::Method | NodeKind::SingletonMethod
+                .filter(|n| is_symbol_kind(&n.kind))
+                .map(|n| {
+                    (
+                        format!("{}:{}", n.file_path, n.name),
+                        per_symbol.get(n.id.as_str()).copied().unwrap_or(0.0),
                     )
                 })
+                .collect()
+        }
+        (_, "symbol") => {
+            // Fallback for a metric outside the declared enum: per-symbol
+            // complexity.
+            nodes
+                .iter()
+                .filter(|n| is_symbol_kind(&n.kind))
                 .map(|n| {
                     let c = f64::from(n.branches + n.loops + n.returns + n.max_nesting);
                     (format!("{}:{}", n.file_path, n.name), c)
@@ -680,26 +771,29 @@ pub(super) async fn handle_test_risk(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let all_nodes = cg.get_all_nodes().await?;
-    let all_edges = cg.get_all_edges().await?;
+    // `calls` only, selected in SQL rather than filtered out of the whole table
+    // on each of the three passes below (#418).
+    let all_edges = cg.db().get_edges_by_kind(EdgeKind::Calls).await?;
 
-    // Build a map from node_id to file_path for fast lookup
-    let node_to_file: HashMap<String, String> = all_nodes
-        .iter()
-        .map(|n| (n.id.clone(), n.file_path.clone()))
-        .collect();
+    // Graph-wide id -> file_path, taken as a two-column projection rather than
+    // by materialising every `Node` (#411). The map has to span the whole
+    // graph — the edge walk below follows references anywhere, and a test in
+    // `tests/` calling a function in `src/` is precisely what this tool looks
+    // for — but it never needs the other twenty-six columns.
+    let node_to_file: HashMap<String, String> = cg.db().get_node_paths().await?;
 
-    // Collect all function/method IDs to check for #[test] annotations.
-    let fn_ids: Vec<String> = all_nodes
-        .iter()
-        .filter(|n| {
-            matches!(
-                n.kind,
-                NodeKind::Function | NodeKind::Method | NodeKind::SingletonMethod
-            )
-        })
-        .map(|n| n.id.clone())
-        .collect();
+    // Everything else here concerns executable nodes only, so the kinds are
+    // selected in SQL instead of filtered out of the whole table three times.
+    let all_nodes = cg
+        .db()
+        .get_nodes_filtered(&crate::db::NodeFilter::new().kinds(&[
+            NodeKind::Function,
+            NodeKind::Method,
+            NodeKind::SingletonMethod,
+        ]))
+        .await?;
+
+    let fn_ids: Vec<String> = all_nodes.iter().map(|n| n.id.clone()).collect();
     let test_annotated_fns = cg
         .get_test_annotated_node_ids(&fn_ids)
         .await

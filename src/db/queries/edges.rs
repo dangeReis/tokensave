@@ -1461,6 +1461,120 @@ impl Database {
         collect_rows(&mut rows, row_to_edge, "get_all_edges").await
     }
 
+    /// Returns every edge of one kind.
+    ///
+    /// The predicate belongs in SQL: `calls` is 19,282 of this repository's
+    /// 25,580 edges, so a consumer that filters on kind after the fact carries
+    /// a quarter of the table for nothing (#418).
+    pub async fn get_edges_by_kind(&self, kind: EdgeKind) -> Result<Vec<Edge>> {
+        let mut rows = self
+            .conn()
+            .query(
+                "SELECT source, target, kind, line FROM edges WHERE kind = ?1",
+                params![kind.as_str()],
+            )
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query edges by kind: {e}"),
+                operation: "get_edges_by_kind".to_string(),
+            })?;
+
+        collect_rows(&mut rows, row_to_edge, "get_edges_by_kind").await
+    }
+
+    /// Returns every edge whose kind is in `kinds`.
+    ///
+    /// Empty `kinds` returns nothing, not everything: a caller asking for no
+    /// kinds wants no rows, and silently widening that to the whole table is
+    /// how #418's loads got there.
+    pub async fn get_edges_by_kinds(&self, kinds: &[EdgeKind]) -> Result<Vec<Edge>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 1)).collect();
+        let sql = format!(
+            "SELECT source, target, kind, line FROM edges WHERE kind IN ({})",
+            placeholders.join(", ")
+        );
+        let param_values: Vec<libsql::Value> = kinds
+            .iter()
+            .map(|k| libsql::Value::Text(k.as_str().to_string()))
+            .collect();
+        let mut rows = self
+            .conn()
+            .query(&sql, libsql::params_from_iter(param_values))
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query edges by kinds: {e}"),
+                operation: "get_edges_by_kinds".to_string(),
+            })?;
+
+        collect_rows(&mut rows, row_to_edge, "get_edges_by_kinds").await
+    }
+
+    /// Returns `(node_id, in_degree, out_degree)` for the `limit` nodes with the
+    /// highest combined degree, computed in SQL.
+    ///
+    /// The caller wants at most `limit` rows — `tokensave_hotspots` defaults to
+    /// 10 and caps at 100 — so materialising every edge to tally degrees in
+    /// memory carries the whole table to emit a hundred rows at most (#418).
+    ///
+    /// A self-edge counts toward neither degree, so a recursive call does not
+    /// make a symbol look more connected to the rest of the graph than it is.
+    /// This matches the `gini` fan arms, which have always excluded them on the
+    /// same reasoning — a recursive call is not a dependant of itself — and
+    /// #431 settled the disagreement in their favour. The 405 self-edges in
+    /// this repository are all `calls`, 1.6% of 25,636, and excluding them left
+    /// the top twelve in identical order.
+    ///
+    /// Ties are broken by `id`, so equal-degree nodes come back in a fixed
+    /// order. The in-memory tally this replaced sorted a `HashMap`'s iteration
+    /// order and varied between runs on an unchanged index (#418).
+    pub async fn get_top_degree_nodes(&self, limit: usize) -> Result<Vec<(String, u32, u32)>> {
+        let sql = "SELECT id, \
+                          SUM(inc) AS in_degree, \
+                          SUM(outg) AS out_degree \
+                   FROM ( \
+                     SELECT target AS id, 1 AS inc, 0 AS outg FROM edges \
+                       WHERE source <> target \
+                     UNION ALL \
+                     SELECT source AS id, 0 AS inc, 1 AS outg FROM edges \
+                       WHERE source <> target \
+                   ) \
+                   GROUP BY id \
+                   ORDER BY (in_degree + out_degree) DESC, id ASC \
+                   LIMIT ?1";
+        let mut rows = self
+            .conn()
+            .query(sql, params![limit as i64])
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query top-degree nodes: {e}"),
+                operation: "get_top_degree_nodes".to_string(),
+            })?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read top-degree row: {e}"),
+            operation: "get_top_degree_nodes".to_string(),
+        })? {
+            let read = |i: i32, what: &str| -> Result<i64> {
+                row.get::<i64>(i).map_err(|e| TokenSaveError::Database {
+                    message: format!("failed to read {what}: {e}"),
+                    operation: "get_top_degree_nodes".to_string(),
+                })
+            };
+            let id = row.get::<String>(0).map_err(|e| TokenSaveError::Database {
+                message: format!("failed to read id: {e}"),
+                operation: "get_top_degree_nodes".to_string(),
+            })?;
+            let in_degree = u32::try_from(read(1, "in_degree")?).unwrap_or(u32::MAX);
+            let out_degree = u32::try_from(read(2, "out_degree")?).unwrap_or(u32::MAX);
+            out.push((id, in_degree, out_degree));
+        }
+        Ok(out)
+    }
+
     /// Deletes all edges originating from a given source node.
     pub async fn delete_edges_by_source(&self, source_id: &str) -> Result<()> {
         self.conn()
