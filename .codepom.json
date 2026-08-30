@@ -1,0 +1,13 @@
+{
+  "reviewMode": "consensus",
+  "reviewMemory": true,
+  "personas": ["correctness", "security", "performance", "design", "simplicity"],
+  "checks": { "enabled": true, "failOn": "Major" },
+  "fix": {
+    "mode": "apply",
+    "threshold": "low",
+    "maxIterations": 2,
+    "prGateEnabled": true,
+    "dodCommands": ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
+  }
+}
